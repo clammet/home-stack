@@ -1,0 +1,45 @@
+{
+  "hostname": "home-stack",
+  "timezone": "Australia/Melbourne",
+  "image_size_mib": 32768,
+  "ssh_authorized_keys": [],
+  "network": {
+    "interface": null,
+    "address": null,
+    "gateway": null,
+    "host_dns": ["1.1.1.1", "9.9.9.9"]
+  },
+  "logging": {"storage": "volatile", "max_level": "crit"},
+  "updates": {
+    "container_calendar": "*-*-* 03:00:00",
+    "os_calendar": "Sun *-*-* 04:00:00",
+    "random_delay_seconds": 600,
+    "health_timeout_seconds": 600,
+    "health_successes": 3,
+    "retry_failed_after_hours": 24
+  },
+  "notifications": {"webhook_url": null},
+  "apps": [
+    {
+      "name": "pihole",
+      "kind": "pihole",
+      "image": "docker.io/pihole/pihole:latest",
+      "settings": {
+        "admin_password": "REPLACE-WITH-A-PRIVATE-PASSWORD",
+        "web_port": 80,
+        "upstream_dns": ["1.1.1.1", "9.9.9.9"],
+        "dnssec": false,
+        "domain_needed": false,
+        "cache_optimizer": 3600,
+        "web_session_timeout": 1800,
+        "adlists": null,
+        "local_records": []
+      }
+    },
+    {
+      "name": "homeassistant",
+      "kind": "homeassistant",
+      "image": "ghcr.io/home-assistant/home-assistant:stable"
+    }
+  ]
+}

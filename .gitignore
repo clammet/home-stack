@@ -1,0 +1,10 @@
+config.json
+config.*.private.json
+build/
+dist/
+downloads/
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+tmp/
