@@ -15,6 +15,8 @@ python3 build-macos.py --config-dir ../my-private-appliance \
 ```text
 config.json
 homeassistant-setup.json
+immich/
+  immich-config.json
 homeassistant/
   configuration.yaml
   automations.yaml
@@ -86,6 +88,14 @@ YAML remains the source of truth for YAML-defined settings and dashboards; some 
 The `mosquitto` preset uses `docker.io/eclipse-mosquitto:2`, a single managed configuration/data tree, port 1883, and a TCP availability probe. Set `settings.users` to objects containing `username` and a password secret reference. The first seed generates an authenticated listener with retained-message persistence and converts its private password file to hashes using the bundled image's `mosquitto_passwd`; passwords never appear in command arguments.
 
 TCP availability does not prove authentication/discovery. Commission with a real client, restart both services, and verify retained discovery and reconnect behaviour. This is a trusted-LAN, non-TLS listener by default. If different security/network requirements apply, provide an appropriate dedicated service configuration.
+
+## Immich preset
+
+The synthetic configuration enables Immich with normal onboarding and UI-managed settings. The `immich/immich-config.json` placeholder is inactive until you select `"seed": "immich"` and `"settings": {"config_file": "immich-config.json"}` on that app. File configuration is authoritative and disables editing Immich settings in the UI; it does not create an administrator. See [Immich](immich.md) for configuration options, grouped updates and storage requirements.
+
+## Seafile preset
+
+The synthetic configuration also enables Seafile on port 8080. It initializes its own database and admin account, then presents its normal login page. Omit Seafile settings to generate private initial credentials, or configure `settings.server_url`, `settings.admin_email` and a `settings.admin_password` secret reference. Generic shared-volume seeds are rejected because partial configuration can bypass upstream initialization. See [Seafile first login, settings and grouped updates](seafile.md).
 
 ## Validation
 

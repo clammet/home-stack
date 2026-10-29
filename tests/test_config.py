@@ -90,9 +90,9 @@ class ConfigurationTests(unittest.TestCase):
     def test_generic_app_and_overrides(self):
         raw = json.loads(EXAMPLE.read_text())
         raw['apps'].append({'name': 'example', 'kind': 'container', 'image': 'ghcr.io/example/service:stable',
-                            'environment': {'MODE': 'safe'}, 'ports': ['8080:80/tcp'],
-                            'health': {'kind': 'http', 'url': 'http://127.0.0.1:8080/'}})
+                            'environment': {'MODE': 'safe'}, 'ports': ['8088:80/tcp'],
+                            'health': {'kind': 'http', 'url': 'http://127.0.0.1:8088/'}})
         parsed = self.parse(raw)
-        self.assertEqual(parsed['apps'][2]['data_path'], '/data')
-        self.assertEqual(parsed['apps'][2]['environment'], {'MODE': 'safe'})
+        self.assertEqual(parsed['apps'][-1]['data_path'], '/data')
+        self.assertEqual(parsed['apps'][-1]['environment'], {'MODE': 'safe'})
         self.assertIsNone(load(EXAMPLE, ['updates.os_calendar=null'])['updates']['os_calendar'])

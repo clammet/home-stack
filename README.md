@@ -1,6 +1,6 @@
 # Home Stack
 
-Build an ARM64 openSUSE MicroOS appliance for a Raspberry Pi 5 with an NVMe HAT. JSON selects the initial containers; the supplied presets deploy Home Assistant Container and Pi-hole. Application data and container storage live on SSD. OS and container updates run unattended, with health checks, application data rollback, and optional problem notifications.
+Build an ARM64 openSUSE MicroOS appliance for a Raspberry Pi 5 with an NVMe HAT. JSON selects the initial containers; the default configuration deploys Home Assistant Container, Pi-hole, Immich and Seafile Community Edition. A Mosquitto preset and generic containers are also available. Application data and container storage live on SSD. OS and container updates run unattended, with health checks, application data rollback, and optional problem notifications.
 
 **Status: experimental.** A complete image build and the automated tests pass. The supplied September 2026 openSUSE hardware documentation still lists SD-only boot; the stock MicroOS image must not be treated as NVMe-ready. Your working HAOS NVMe installation establishes the hardware/EEPROM path, but uses a different OS boot chain. See [Pi 5 boot support](docs/pi5-boot.md). This repository does not yet supply a hardware-qualified NVMe base image.
 
@@ -44,13 +44,17 @@ sudo python3 build.py --config config.json \
 
 Linux also accepts `--experimental-upstream`. A custom `--base-url` requires a trusted `--base-sha256`. The experimental download checks the checksum published over HTTPS; this is integrity checking, **not independent verification of the upstream GPG signature**. Verify signed downloads separately before trusting a pinned base.
 
-Output is `dist/home-stack-pi5.img`, a SHA-256 file, and a nonsecret manifest of base/container inputs. Output files are never overwritten, and the builder only partitions temporary regular files through loop devices. Both ARM64 container images are bundled. First boot still needs internet access to install signed MicroOS packages through Combustion.
+Output is `dist/home-stack-pi5.img`, a SHA-256 file, and a nonsecret manifest of base/container inputs. Output files are never overwritten, and the builder only partitions temporary regular files through loop devices. All enabled ARM64 container images, including Immich's and Seafile's dependencies, are bundled. First boot still needs internet access to install signed MicroOS packages through Combustion.
 
 The default raw image is 32 GiB. Its root is expanded during assembly; the final seed partition caps usable space at the configured image size. A larger SSD's remaining space is unused. Set `image_size_mib` before building to allocate more space, leaving enough working space for downloads, image copies, and future application snapshots. A nominal 32 GB drive is smaller than this default image; use a larger SSD.
 
 Write the image with Raspberry Pi Imager's **Use custom** option, without Raspberry Pi OS customization. This builder never writes a physical disk. See [network installation](docs/network-install.md) for installing directly to NVMe without an SD card.
 
 After first boot, open Pi-hole at `http://<pi-address>/admin/` and Home Assistant at `http://<pi-address>:8123/`. A Home Assistant setup manifest can create the owner, configure integrations and rooms, and apply initial settings automatically. Without a manifest, complete normal onboarding. Zigbee device joining still requires commissioning. This is Home Assistant Container, without the Home Assistant OS/Supervisor app store. It uses host networking and privileged access for hardware, following the upstream container deployment model; Podman compatibility still needs appliance validation. [Home Assistant installation](https://www.home-assistant.io/installation/linux/)
+
+Open Immich at `http://<pi-address>:2283/` and complete its normal onboarding. It follows the latest stable `release` images automatically, using the existing daily update timer. Optional configuration-file seeding is available; the defaults leave settings editable in Immich. See [Immich configuration and storage](docs/immich.md), including hardware requirements and update limits.
+
+Open Seafile at `http://<pi-address>:8080/`. It initializes automatically and opens its normal login page. Supply initial admin credentials in JSON or retrieve the generated credentials from the appliance; see [Seafile first login and configuration](docs/seafile.md). Seafile, MariaDB and Redis follow moving maintenance tags through the daily update timer, with grouped health checks and rollback.
 
 After verifying DNS, configure your router to advertise the Pi as the clients' DNS server. A public secondary DNS server can bypass blocking even while Pi-hole is healthy; it is not guaranteed to be used only during failure.
 
@@ -60,14 +64,14 @@ After verifying DNS, configure your router to advertise the Pi as the clients' D
 
 | Setting | Behaviour |
 | --- | --- |
-| `apps` | Array of deployments; `name` must be unique and `kind` is `pihole`, `homeassistant`, `mosquitto`, or `container` |
+| `apps` | Array of deployments; `name` must be unique and `kind` is `pihole`, `homeassistant`, `mosquitto`, `immich`, `seafile`, or `container` |
 | `apps[].image` | Fully qualified image reference; use a moving tag for automatic releases or a digest to pin |
 | `apps[].enabled` | Defaults to true; disabled apps are not bundled or deployed |
 | `apps[].auto_update` | Defaults to true; false retains boot/recovery checks but disables automatic image pulls |
 | `apps[].environment` | Additional string environment values; managed preset values cannot be overridden |
 | `apps[].seed` | Initial data directory, optionally with explicitly named private overlays; never reapplied during ordinary updates |
 | `apps[].setup` | Home Assistant version-1 first-install manifest; resumable onboarding/integration/registry initialization |
-| `apps[].settings` | Pi-hole password, HTTP port, upstream DNS, DNSSEC, domain-name forwarding policy, cache optimizer, web session timeout, optional initial adlists and local DNS records |
+| `apps[].settings` | Preset settings: Pi-hole DNS/web options, Mosquitto users, Immich settings, or Seafile web port, public URL, initial admin and dependency images |
 | `network` | Wired interface (`null` selects Ethernet automatically; explicit names such as `end0` also work), optional static IPv4 address/gateway, independent host DNS |
 | `updates` | Container/OS systemd calendars, jitter, health probation, failed-image cooldown |
 | `logging` | RAM-only or no host journal; default severity is `crit` |
@@ -82,14 +86,14 @@ A generic application needs an explicit host-accessible health check and one man
   "kind": "container",
   "image": "ghcr.io/your-org/your-service:stable",
   "network": "bridge",
-  "ports": ["8080:80/tcp"],
+  "ports": ["8088:80/tcp"],
   "data_path": "/data",
   "environment": {"MODE": "production"},
-  "health": {"kind": "http", "url": "http://127.0.0.1:8080/"}
+  "health": {"kind": "http", "url": "http://127.0.0.1:8088/"}
 }
 ```
 
-TCP health uses `{"kind":"tcp","port":8080}`. Generic containers can opt into host networking or privileges. Extra volumes/devices, multiple data mounts and arbitrary health shell commands are intentionally not exposed. For host networking, only the health port is opened by the generic preset; other protocol/firewall requirements need a dedicated preset. Keep all migration-sensitive data in the managed directory. Preset health/mount contracts are fixed; only one enabled Pi-hole and one enabled Home Assistant are supported.
+TCP health uses `{"kind":"tcp","port":8088}`. Generic containers can opt into host networking or privileges. Extra volumes/devices, multiple data mounts and arbitrary health shell commands are intentionally not exposed. For host networking, only the health port is opened by the generic preset; other protocol/firewall requirements need a dedicated preset. Keep all migration-sensitive data in the managed directory. Preset health/mount contracts are fixed; only one enabled instance of each preset is supported. Immich and Seafile dependency names are reserved to prevent clashes with other apps.
 
 Adlists seed new Pi-hole data only; subsequent UI changes survive updates. Pi-hole environment settings remain authoritative. Home Assistant keeps configuration, integration state and recorder history on SSD. Its initial YAML limits application logging to warnings; unlike Pi-hole's logs, its own files can persist in its data directory.
 
@@ -101,7 +105,11 @@ Containers check daily at 03:00; MicroOS checks Sundays at 04:00, in the configu
 
 For each container, the controller pulls before stopping the service, stops cleanly, copies its data using reflinks where available, starts the new image against the copy, and requires consecutive successful probes. Pi-hole checks local DNS over both UDP and TCP plus its web page; Home Assistant checks its local HTTP page. Acceptance retains the old image and data as one rollback generation. Failure or interrupted deployment restores that pair. Normal recovery runs every five minutes; rejected image IDs have a 24-hour cooldown.
 
-These probes test service availability, not every integration or automation. A later rollback can lose changes made since the retained data snapshot. Local rollback copies are not backups against SSD failure; arrange an independent backup for Home Assistant data. An update briefly interrupts the updated service, and an OS reboot interrupts both. A single Pi cannot provide uninterrupted DNS through reboots.
+Immich updates as a group: server, machine learning, PostgreSQL and Redis-compatible Valkey images are resolved before stopping anything. All four services stop before copying media, database, queue data and model cache. Health probation checks every service and the unauthenticated server ping, so a fresh installation can be accepted before an account exists. Recovery restores the complete image set and its data generation.
+
+Seafile also updates as a group. The controller waits for MariaDB initialization before starting Seafile, then checks the database, Redis, web API and file server. Files, configuration, database and credentials are copied together. Dependency-only changes trigger the same update and rollback process. See [Seafile update scope](docs/seafile.md#updates-and-recovery).
+
+These probes test service availability, not every integration or automation. A later rollback can lose changes made since the retained data snapshot. Local rollback copies are not backups against SSD failure; arrange independent backups for Home Assistant, Immich and Seafile, including their databases. An update briefly interrupts the updated service, and an OS reboot interrupts all services. A single Pi cannot provide uninterrupted DNS through reboots.
 
 MicroOS transactional updates and health-checker provide OS recovery once Linux boots far enough to run health checks. They cannot guarantee recovery from EEPROM, U-Boot, FAT boot partition, power, or SSD failures. [MicroOS architecture](https://get.opensuse.org/microos/)
 

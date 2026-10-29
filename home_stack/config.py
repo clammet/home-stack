@@ -1,4 +1,5 @@
 """Strict JSON configuration; renderers never interpolate unvalidated shell text."""
+import base64
 import copy
 import ipaddress
 import json
@@ -6,6 +7,8 @@ from pathlib import Path, PurePosixPath
 import os
 
 from .config_directory import expand, validate_setup
+from runtime.images import (IMMICH_DATABASE, IMMICH_REDIS, SEAFILE_DATABASE, SEAFILE_REDIS,
+                            deployment_name, image_references)
 import re
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -21,7 +24,9 @@ DEFAULTS = {
                 "health_successes": 3, "retry_failed_after_hours": 24},
     "notifications": {"webhook_url": None},
     "apps": [{"name": "pihole", "kind": "pihole"},
-             {"name": "homeassistant", "kind": "homeassistant"}],
+             {"name": "homeassistant", "kind": "homeassistant"},
+             {"name": "immich", "kind": "immich"},
+             {"name": "seafile", "kind": "seafile"}],
 }
 COMMON = {"name": "", "kind": "container", "enabled": True, "auto_update": True,
           "image": "", "environment": {}, "ports": [], "network": "bridge",
@@ -38,6 +43,14 @@ PRESETS = {
     "mosquitto": {"image": "docker.io/eclipse-mosquitto:2",
                   "data_path": os.path.join(os.sep, "mosquitto"),
                   "settings": {"users": []}},
+    "immich": {"image": "ghcr.io/immich-app/immich-server:release",
+               "settings": {"web_port": 2283, "config_file": None,
+                            "machine_learning_image": None,
+                            "database_image": IMMICH_DATABASE, "redis_image": IMMICH_REDIS}},
+    "seafile": {"image": "docker.io/seafileltd/seafile-mc:13.0-latest", "data_path": "/shared",
+                "settings": {"web_port": 8080, "server_url": None,
+                             "admin_email": None, "admin_password": None,
+                             "database_image": SEAFILE_DATABASE, "redis_image": SEAFILE_REDIS}},
     "container": {},
 }
 
@@ -94,7 +107,7 @@ def url(value, name, https=False):
 
 def app_config(raw):
     if not isinstance(raw, dict) or not isinstance(raw.get("kind"), str) or raw["kind"] not in PRESETS:
-        raise ValueError("Each app requires kind: pihole, homeassistant, mosquitto, or container")
+        raise ValueError("Each app requires kind: pihole, homeassistant, mosquitto, immich, seafile, or container")
     kind = raw["kind"]
     base = copy.deepcopy(COMMON)
     base.update(copy.deepcopy(PRESETS[kind]))
@@ -107,9 +120,11 @@ def app_config(raw):
     for key in ("enabled", "auto_update", "privileged"):
         if type(app[key]) is not bool:
             raise ValueError(f"apps.{key} must be boolean")
-    ref = line(app["image"], "image")
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.:-]*/[a-zA-Z0-9_/.:@-]+", ref) or not ("." in ref.split("/")[0] or ":" in ref.split("/")[0] or ref.startswith("localhost/")):
-        raise ValueError("Container image must be a fully qualified registry reference")
+    line(app["image"], "image")
+    for reference in image_references(app).values():
+        ref = line(reference, "image")
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.:-]*/[a-zA-Z0-9_/.:@-]+", ref) or not ("." in ref.split("/")[0] or ":" in ref.split("/")[0] or ref.startswith("localhost/")):
+            raise ValueError("Container image must be a fully qualified registry reference")
     if app["network"] not in ("bridge", "host"):
         raise ValueError("network must be bridge or host")
     path = PurePosixPath(line(app["data_path"], "data_path"))
@@ -123,6 +138,16 @@ def app_config(raw):
         line(value, "environment value", empty=True)
         if key == "TZ" or (kind == "pihole" and (key.startswith("FTLCONF_") or key == "TAIL_FTL_LOG")):
             raise ValueError("Use timezone/settings for managed environment values")
+        if kind == "immich" and (key.startswith(("DB_", "REDIS_", "POSTGRES_")) or key in {
+            "IMMICH_CONFIG_FILE", "IMMICH_MEDIA_LOCATION", "IMMICH_HOST", "IMMICH_PORT",
+            "IMMICH_WORKERS_INCLUDE", "IMMICH_WORKERS_EXCLUDE", "CREDENTIALS_DIRECTORY",
+            "MACHINE_LEARNING_CACHE_FOLDER", "TRANSFORMERS_CACHE"}):
+            raise ValueError("Immich connection, worker, mount and port environment values are managed")
+        if kind == "seafile" and (key.startswith(("SEAFILE_", "INIT_SEAFILE_", "MYSQL_", "MARIADB_",
+                                                  "REDIS_", "MEMCACHED_", "ENABLE_", "CLUSTER_")) or key in {
+            "TIME_ZONE", "JWT_PRIVATE_KEY", "CACHE_PROVIDER", "SITE_ROOT", "NON_ROOT",
+            "SERVER_NAME", "SERVER_IP", "CCNET_DB", "SEAFILE_DB", "SEAHUB_DB"}):
+            raise ValueError("Seafile connection, initialization and feature environment values are managed")
     strings(app["ports"], "ports")
     for port in app["ports"]:
         match = re.fullmatch(r"(\d+):(\d+)/(tcp|udp)", port)
@@ -136,7 +161,43 @@ def app_config(raw):
             if app[key] != base[key]:
                 raise ValueError(f"{kind}.{key} is fixed by the preset")
         if app["ports"] or app["health"]:
-            raise ValueError("Preset ports and health checks are managed; use pihole.settings.web_port")
+            raise ValueError("Preset ports and health checks are managed; use settings.web_port where supported")
+    if kind == "immich":
+        integer(app["settings"]["web_port"], 1, 65535, "immich.web_port")
+        filename = app["settings"]["config_file"]
+        if filename is not None:
+            from .config_directory import seed_name
+            seed_name(filename)
+            files = (app.get("seed") or {}).get("files", {})
+            if filename not in files:
+                raise ValueError("Immich config_file must name a JSON file in its seed")
+            try:
+                value = json.loads(base64.b64decode(files[filename], validate=True))
+            except (ValueError, TypeError, UnicodeError):
+                raise ValueError("Immich config_file must contain valid JSON") from None
+            if not isinstance(value, dict):
+                raise ValueError("Immich config_file must contain a JSON object")
+    if kind == "seafile":
+        s = app["settings"]
+        integer(s["web_port"], 1, 65535, "seafile.web_port")
+        if s["server_url"] is not None:
+            parsed = url(s["server_url"], "seafile.server_url")
+            # The container interpolates this authority into generated config.
+            if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]+)?", parsed.netloc)
+                    or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+                raise ValueError("seafile.server_url requires a hostname/IPv4 URL without a path")
+            if parsed.port is not None:
+                integer(parsed.port, 1, 65535, "seafile.server_url port")
+        if (s["admin_email"] is None) != (s["admin_password"] is None):
+            raise ValueError("Seafile admin_email and admin_password must be supplied together")
+        if s["admin_email"] is not None:
+            if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", line(s["admin_email"], "seafile.admin_email")):
+                raise ValueError("Invalid Seafile admin_email")
+            if len(line(s["admin_password"], "seafile.admin_password")) < 12:
+                raise ValueError("Seafile admin_password must contain at least 12 characters")
+        # Partial shared-volume seeds can suppress upstream config/DB creation.
+        if app["seed"] is not None:
+            raise ValueError("Seafile initialization uses settings, not partial shared-volume seeds")
     if kind == "pihole":
         p = app["settings"]
         if len(line(p["admin_password"], "Pi-hole admin_password")) < 12:
@@ -257,7 +318,7 @@ def load(path=None, overrides=()):
     if not isinstance(config["apps"], list) or not config["apps"]:
         raise ValueError("apps must be a nonempty array")
     config["apps"] = [app_config(app) for app in config["apps"]]
-    names, presets, ports = set(), set(), set()
+    names, deployments, presets, ports = set(), set(), set(), set()
     for app in config["apps"]:
         if app["name"] in names:
             raise ValueError("App names must be unique")
@@ -265,6 +326,11 @@ def load(path=None, overrides=()):
         if not app["enabled"]:
             continue
         kind = app["kind"]
+        for component in image_references(app):
+            name = deployment_name(app, component)
+            if name in deployments:
+                raise ValueError("App names conflict with a managed dependency container")
+            deployments.add(name)
         if kind != "container":
             if kind in presets:
                 raise ValueError("Only one enabled instance of each preset is supported")
@@ -276,6 +342,10 @@ def load(path=None, overrides=()):
             bindings = ["1883:1883/tcp"]
         if kind == "homeassistant":
             bindings = ["8123:8123/tcp"]
+        if kind == "immich":
+            bindings = [f"{app['settings']['web_port']}:2283/tcp"]
+        if kind == "seafile":
+            bindings = [f"{app['settings']['web_port']}:80/tcp"]
         for binding in bindings:
             host, _, protocol = re.split(r"[:/]", binding)
             pair = (int(host), protocol)

@@ -25,7 +25,7 @@ def entry(image, url, release_date, icon_url, allow_http=False):
     if not size:
         raise ValueError("Image is empty")
     return {"name": "Home Stack — MicroOS (Pi 5)",
-            "description": "Home Assistant and Pi-hole with unattended updates; validate this image on your NVMe HAT before deployment",
+            "description": "Self-hosted home hub with unattended updates; validate this image on your NVMe HAT before deployment",
             "icon": icon_url, "url": url, "extract_size": size, "extract_sha256": digest.hexdigest(),
             "image_download_size": image.stat().st_size, "release_date": release_date,
             "devices": ["pi5"], "init_format": "none"}

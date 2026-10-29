@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shlex
 import shutil
+from runtime.images import deployment_name, image_references
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime" / "controller.py"
 
@@ -35,6 +36,20 @@ def environment(config, app):
             "FTLCONF_ntp_ipv4_active": "false", "FTLCONF_ntp_ipv6_active": "false",
             "FTLCONF_ntp_sync_active": "false",
         })
+    if app["kind"] == "immich":
+        env.update(DB_HOSTNAME="database", DB_PORT="5432", DB_USERNAME="postgres",
+                   DB_DATABASE_NAME="immich", REDIS_HOSTNAME="redis", REDIS_PORT="6379")
+        if app["settings"]["config_file"] is not None:
+            env["IMMICH_CONFIG_FILE"] = "/config/" + app["settings"]["config_file"]
+    if app["kind"] == "seafile":
+        env.update(TIME_ZONE=config["timezone"], SEAFILE_MYSQL_DB_HOST="database",
+                   SEAFILE_MYSQL_DB_PORT="3306", SEAFILE_MYSQL_DB_USER="seafile",
+                   SEAFILE_MYSQL_DB_CCNET_DB_NAME="ccnet_db", SEAFILE_MYSQL_DB_SEAFILE_DB_NAME="seafile_db",
+                   SEAFILE_MYSQL_DB_SEAHUB_DB_NAME="seahub_db", CACHE_PROVIDER="redis",
+                   REDIS_HOST="redis", REDIS_PORT="6379", REDIS_PASSWORD="",
+                   SITE_ROOT="/", NON_ROOT="false", ENABLE_GO_FILESERVER="true",
+                   ENABLE_SEADOC="false", ENABLE_NOTIFICATION_SERVER="false",
+                   ENABLE_SEAFILE_AI="false", ENABLE_FACE_RECOGNITION="false")
     return env
 
 
@@ -76,8 +91,14 @@ dns-priority=-100
     write(payload, "config.json", json.dumps(config, indent=2) + "\n")
     for app in apps:
         write(payload, app["name"] + ".env", "".join(f"{k}={v}\n" for k, v in environment(config, app).items()))
+        if app["kind"] == "immich":
+            worker_env = {key: value for key, value in app["environment"].items()
+                          if key.startswith("MACHINE_LEARNING_") or key in ("IMMICH_LOG_LEVEL", "NO_COLOR")}
+            worker_env["TZ"] = config["timezone"]
+            write(payload, app["name"] + "-machine-learning.env", "".join(f"{k}={v}\n" for k, v in worker_env.items()))
     shutil.copyfile(RUNTIME, payload / "controller.py")
     shutil.copyfile(RUNTIME.with_name("ha_setup.py"), payload / "ha_setup.py")
+    shutil.copyfile(RUNTIME.with_name("images.py"), payload / "images.py")
     write(payload, "authorized_keys", "\n".join(config["ssh_authorized_keys"]) + "\n")
     write(payload, "journald.conf", f"""[Journal]
 Storage={config['logging']['storage']}
@@ -127,13 +148,13 @@ printf '%s' '{encoded}' | base64 -d > /etc/NetworkManager/system-connections/hom
 chmod 600 /etc/NetworkManager/system-connections/home-stack.nmconnection
 if [ "${{1-}}" = --prepare ]; then exit 0; fi
 
-zypper --non-interactive install --no-recommends podman python3 health-checker curl bluez
+zypper --non-interactive install --no-recommends podman python3 health-checker curl bluez{' netavark aardvark-dns' if any(a['kind'] in ('immich', 'seafile') for a in apps) else ''}
 # Persistent subvolumes must be mounted inside the first-boot transaction.
 mountpoint -q /var || mount /var
 mountpoint -q /usr/local || mount /usr/local
 install -d -m 700 /etc/home-stack /var/lib/home-stack
 install -m 600 payload/config.json payload/*.env /etc/home-stack/
-install -m 644 payload/controller.py payload/ha_setup.py /etc/home-stack/
+install -m 644 payload/controller.py payload/ha_setup.py payload/images.py /etc/home-stack/
 install -m 644 payload/units/* /etc/systemd/system/
 printf '%s\\n' {shlex.quote(config['hostname'])} > /etc/hostname
 ln -snf {shlex.quote('/usr/share/zoneinfo/' + config['timezone'])} /etc/localtime
@@ -145,7 +166,11 @@ trap 'umount /run/home-stack-bootstrap' EXIT
 """
     for app in apps:
         name = app["name"]
-        script += f"install -d -m 700 /var/lib/home-stack/{name}\ninstall -m 600 /run/home-stack-bootstrap/archives/{name}.tar /var/lib/home-stack/{name}/bootstrap.tar\n"
+        script += f"install -d -m 700 /var/lib/home-stack/{name}\n"
+        for component in image_references(app):
+            archive = deployment_name(app, component)
+            target = "bootstrap.tar" if component == "server" else "bootstrap-" + component + ".tar"
+            script += f"install -m 600 /run/home-stack-bootstrap/archives/{archive}.tar /var/lib/home-stack/{name}/{target}\n"
     script += f"""umount /run/home-stack-bootstrap
 trap - EXIT
 mkdir -p /etc/systemd/resolved.conf.d /etc/NetworkManager/conf.d
@@ -175,6 +200,10 @@ printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\nPermitRoot
             ports = ["1883:1883/tcp"]
         elif app["kind"] == "homeassistant":
             ports = ["8123:8123/tcp", "5353:5353/udp", "1900:1900/udp"]
+        elif app["kind"] == "immich":
+            ports = [f"{app['settings']['web_port']}:2283/tcp"]
+        elif app["kind"] == "seafile":
+            ports = [f"{app['settings']['web_port']}:80/tcp"]
         elif app["network"] == "host":
             port = app["health"].get("port")
             if app["health"]["kind"] == "http":

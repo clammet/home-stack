@@ -21,3 +21,19 @@ Not established by these tests:
 Unit tests simulate container execution to inject failure and power-loss states. Disk integration tests use synthetic MicroOS/AArch64 markers, not a Pi boot. Do not interpret either as a hardware-certified appliance release.
 
 Use the [Pi 5 acceptance checklist](pi5-boot.md) before deployment.
+
+## Immich support — 29 October 2026
+
+Local validation covers Immich configuration parsing, matching image tags and explicit pins, optional JSON seeds and transfer, reserved environment values, port/dependency-name collisions, all four ARM64 archive build inputs, private dependency networking, credential handling and first-run health checks without an account. Simulated deployments cover dependency-only updates, partial pull failures, interrupted upgrades, group rollback with media/database preservation, initial failure cleanup, missing-data refusal and cross-application image retention.
+
+Both the default configuration and the synthetic configuration directory render successfully. Generated shell scripts pass `bash -n`, and the rendered standalone controller imports its bundled helpers successfully. The optional Immich configuration example also loads and renders. The local test suite has 72 tests: 69 pass and the three opt-in Linux disk integration tests are skipped.
+
+These checks mock container execution; no live Immich onboarding, upload, processing, database migration or Podman/SELinux acceptance on the Pi has been established. The earlier complete disk-image build predates Immich support. Follow the [Immich acceptance steps](immich.md#storage-and-hardware) before relying on a new installation.
+
+## Seafile support — 29 October 2026
+
+Local validation covers minimal and preconfigured Seafile deployments, secret-file resolution and transfer, generated private credentials, static/DHCP URL selection, reserved environment values, rejected partial shared-volume seeds, port/dependency-name conflicts, and bundling all three ARM64 image inputs. Runtime checks cover database readiness before server startup, private dependency networking, mounted-generation data, missing-data refusal, unauthenticated web/file-server probes, dependency-only updates, failed pulls, and complete file/database/credential restoration after failed or interrupted migrations.
+
+Both example configurations render, the generated shell scripts pass `bash -n`, and the standalone rendered controller imports its bundled helpers. The full local suite has 83 tests: 80 pass and the three opt-in Linux disk integration tests are skipped. The existing localhost HTTP tests require socket access outside the restricted execution sandbox.
+
+Container execution is simulated. No local Docker daemon was running, and live Seafile first login, file transfers, sync, MariaDB migrations, Podman/SELinux behaviour and update/rollback on the Pi remain unverified. The earlier full image build predates Seafile support. Follow the [Seafile acceptance steps](seafile.md#storage-and-acceptance) on the target.

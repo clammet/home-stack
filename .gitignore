@@ -1,4 +1,5 @@
 config.json
+!examples/configuration/config.json
 config.*.private.json
 build/
 dist/

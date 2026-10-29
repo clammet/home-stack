@@ -40,6 +40,19 @@
       "name": "homeassistant",
       "kind": "homeassistant",
       "image": "ghcr.io/home-assistant/home-assistant:stable"
+    },
+    {
+      "name": "immich",
+      "kind": "immich",
+      "image": "ghcr.io/immich-app/immich-server:release",
+      "auto_update": true,
+      "settings": {"web_port": 2283, "config_file": null}
+    },
+    {
+      "name": "seafile",
+      "kind": "seafile",
+      "auto_update": true,
+      "settings": {"web_port": 8080, "server_url": null}
     }
   ]
 }

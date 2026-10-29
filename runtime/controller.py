@@ -3,21 +3,39 @@
 import argparse
 import base64
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import socket
 import struct
 import subprocess
 import time
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
+
+if __package__:
+    from .images import deployment_name, image_references
+else:
+    from images import deployment_name, image_references
 
 ROOT = Path("/var/lib/home-stack")
 CONFIG = Path("/etc/home-stack/config.json")
 CANARY = "home-stack-health.test"
 CANARY_IP = "192.0.2.1"
+
+
+def image_ids(image):
+    return set(image.values()) if isinstance(image, dict) else {image}
+
+
+def image_key(image):
+    if isinstance(image, dict):
+        return "group:" + hashlib.sha256(json.dumps(image, sort_keys=True).encode()).hexdigest()
+    return image
 
 
 def command(*args, check=True, timeout=900):
@@ -135,9 +153,9 @@ class App:
             raise ValueError("Generation cannot be a symlink")
         return path
 
-    def inspect(self):
+    def inspect(self, name=None):
         try:
-            return json.loads(command("podman", "container", "inspect", self.name, timeout=30))[0]
+            return json.loads(command("podman", "container", "inspect", name or self.name, timeout=30))[0]
         except (RuntimeError, ValueError, IndexError):
             return None
 
@@ -149,6 +167,9 @@ class App:
     def stop(self):
         if self.inspect():
             command("podman", "stop", "--time", "60", self.name, timeout=90)
+
+    def remove(self):
+        command("podman", "rm", "--force", "--ignore", self.name, timeout=90)
 
     def start(self, generation):
         directory = self.data(generation)
@@ -218,6 +239,13 @@ class App:
 
     def image(self, reference):
         return json.loads(command("podman", "image", "inspect", reference, timeout=30))[0]["Id"]
+
+    def resolve_images(self, references):
+        return self.image(references["server"])
+
+    def pull_images(self):
+        for reference in image_references(self.app).values():
+            command("podman", "pull", reference)
 
     def seed(self, directory, image=None):
         if self.app["kind"] == "pihole":
@@ -289,14 +317,15 @@ class App:
         pending = self.state["pending"]
         if not pending:
             return
-        self.state["failed"][pending["image"]] = time.time()
+        self.state["failed"][image_key(pending["image"])] = time.time()
         self.save()
         if self.state["active"]:
             self.start(self.state["active"])
             if not self.wait_healthy():
                 raise RuntimeError("Rollback failed health checks; recovery will retry")
         else:
-            command("podman", "rm", "--force", "--ignore", self.name)
+            self.stop()
+            self.remove()
         self.state["pending"] = None
         self.save()
         self.cleanup()
@@ -304,6 +333,8 @@ class App:
     def deploy(self, image):
         old = self.state["active"]
         candidate = {"image": image, "data": "gen-" + uuid.uuid4().hex}
+        self.state["images"] = sorted(set(self.state["images"]) | image_ids(image))
+        self.save()
         try:
             self.stop()
             if old:
@@ -328,27 +359,32 @@ class App:
         self.cleanup()
 
     def cooldown(self, image):
-        return time.time() - self.state["failed"].get(image, 0) < self.config["updates"]["retry_failed_after_hours"] * 3600
+        return time.time() - self.state["failed"].get(image_key(image), 0) < self.config["updates"]["retry_failed_after_hours"] * 3600
 
     def bootstrap(self):
-        archive = self.root / "bootstrap.tar"
-        reference = "localhost/home-stack-" + self.app["name"] + ":build"
-        if archive.exists():
-            command("podman", "load", "--input", str(archive))
-        else:
-            reference = self.app["image"]
-            command("podman", "pull", reference)
-        image = self.image(reference)
+        references, archives = {}, []
+        for component, reference in image_references(self.app).items():
+            archive = self.root / ("bootstrap.tar" if component == "server" else "bootstrap-" + component + ".tar")
+            if archive.exists():
+                command("podman", "load", "--input", str(archive))
+                reference = "localhost/home-stack-" + deployment_name(self.app, component) + ":build"
+                archives.append(archive)
+            else:
+                command("podman", "pull", reference)
+            references[component] = reference
+        image = self.resolve_images(references)
         if self.cooldown(image):
             raise RuntimeError("Initial image failed; waiting for retry cooldown")
-        if image in self.state["failed"]:
+        if image_key(image) in self.state["failed"]:
             # An initially broken bundled release must not trap the appliance
             # on that release forever. Pull again after its retry cooldown.
-            command("podman", "pull", self.app["image"])
-            image = self.image(self.app["image"])
+            self.pull_images()
+            image = self.resolve_images(image_references(self.app))
         self.deploy(image)
-        archive.unlink(missing_ok=True)
-        command("podman", "untag", "localhost/home-stack-" + self.app["name"] + ":build", check=False)
+        for archive in archives:
+            archive.unlink(missing_ok=True)
+        for component in references:
+            command("podman", "untag", "localhost/home-stack-" + deployment_name(self.app, component) + ":build", check=False)
 
     def reconcile(self):
         if self.state["pending"]:
@@ -375,11 +411,11 @@ class App:
 
     def update(self):
         self.reconcile()
-        command("podman", "pull", self.app["image"])
-        image = self.image(self.app["image"])
+        self.pull_images()
+        image = self.resolve_images(image_references(self.app))
         if image == self.state["active"]["image"]:
             return
-        self.state["images"] = sorted(set(self.state["images"]) | {image})
+        self.state["images"] = sorted(set(self.state["images"]) | image_ids(image))
         self.save()
         if self.cooldown(image):
             raise RuntimeError("Rejected image remains in retry cooldown")
@@ -388,17 +424,19 @@ class App:
     def cleanup(self):
         retained = [g for g in (self.state["active"], self.state["previous"], self.state["pending"]) if g]
         paths = {self.data(g) for g in retained}
-        images = {g["image"] for g in retained}
+        images = set().union(*(image_ids(g["image"]) for g in retained))
         protected = set(images)
         for app in self.config["apps"]:
             state_path = self.root.parent / app["name"] / "state.json"
             if state_path.exists():
                 other = json.loads(state_path.read_text())
-                protected.update(g["image"] for g in (other["active"], other["previous"], other["pending"]) if g)
+                for generation in (other["active"], other["previous"], other["pending"]):
+                    if generation:
+                        protected.update(image_ids(generation["image"]))
         for path in self.root.glob("gen-*"):
             if path not in paths and path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
-        tracked = set(self.state["images"]) | set(self.state["failed"])
+        tracked = set(self.state["images"]) | {key for key in self.state["failed"] if not key.startswith("group:")}
         for image in tracked - protected:
             if command("podman", "image", "exists", image, check=False, timeout=30) == 0:
                 if command("podman", "image", "rm", image, check=False, timeout=60) != 0:
@@ -406,6 +444,235 @@ class App:
         self.state["images"] = sorted(images)
         self.state["failed"] = dict(sorted(self.state["failed"].items(), key=lambda p: p[1])[-32:])
         self.save()
+
+
+class GroupApp(App):
+    """Resolve, stop and recover dependency containers as one generation."""
+    def component_name(self, component):
+        return "home-stack-" + deployment_name(self.app, component)
+
+    def resolve_images(self, references):
+        return {component: self.image(reference) for component, reference in references.items()}
+
+    def stop(self):
+        # Quiesce application writers before checkpointing their dependencies.
+        for component in self.components:
+            name = self.component_name(component)
+            info = self.inspect(name)
+            if info and info["State"]["Running"]:
+                command("podman", "stop", "--time", "60", name, timeout=90)
+
+    def remove(self):
+        for component in self.components:
+            command("podman", "rm", "--force", "--ignore", self.component_name(component), timeout=90)
+
+    def matches(self, generation):
+        for component in self.components:
+            info = self.inspect(self.component_name(component))
+            folder, target = self.mounts[component]
+            if not (info and info["State"]["Running"] and info["Image"] == generation["image"][component]
+                    and any(m.get("Source") == str(self.data(generation) / folder) and m.get("Destination") == target
+                            for m in info.get("Mounts", []))):
+                return False
+        return True
+
+
+class ImmichApp(GroupApp):
+    """An Immich generation owns all dependency images and persistent data."""
+    components = ("server", "machine-learning", "redis", "database")
+    mounts = {"server": ("media", "/data"), "machine-learning": ("model-cache", "/cache"),
+              "redis": ("redis", "/data"), "database": ("postgres", "/var/lib/postgresql/data")}
+
+    def seed(self, directory, image=None):
+        for folder in ("media", "model-cache", "redis", "postgres", "config"):
+            (directory / folder).mkdir(mode=0o700)
+        super().seed(directory / "config", image)
+        # Generated on the appliance, retained with the DB across every copy.
+        password = secrets.token_urlsafe(32)
+        for name, content in {
+            "server.env": "DB_PASSWORD=" + password + "\n",
+            "database.env": ("POSTGRES_PASSWORD=" + password + "\nPOSTGRES_USER=postgres\n"
+                             "POSTGRES_DB=immich\nPOSTGRES_INITDB_ARGS=--data-checksums\n"),
+        }.items():
+            path = directory / name
+            path.write_text(content)
+            path.chmod(0o600)
+
+    def start(self, generation):
+        directory = self.data(generation)
+        required = [directory / folder for folder, _ in self.mounts.values()]
+        if not all(path.is_dir() for path in [*required, directory / "config"]) or not all(
+            (directory / name).is_file() for name in ("server.env", "database.env")
+        ):
+            raise RuntimeError("Generation data missing; refusing an empty replacement")
+        self.stop()
+        self.remove()
+        network = self.name + "-network"
+        command("podman", "network", "create", "--ignore", network)
+        for component in reversed(self.components):
+            folder, target = self.mounts[component]
+            args = ["--network", network, "--network-alias", "immich-machine-learning" if component == "machine-learning" else component,
+                    "--volume", f"{directory / folder}:{target}:Z"]
+            tail = []
+            if component == "server":
+                args.extend(("--publish", f"{self.app['settings']['web_port']}:2283/tcp",
+                             "--env-file", str(CONFIG.parent / (self.app["name"] + ".env")),
+                             "--env-file", str(directory / "server.env"),
+                             "--volume", f"{directory / 'config'}:/config:ro,Z"))
+            elif component == "database":
+                args.extend(("--env-file", str(directory / "database.env"), "--shm-size=128m"))
+            elif component == "redis":
+                tail = ["valkey-server", "--appendonly", "yes", "--save", ""]
+            elif component == "machine-learning":
+                # Only worker tuning values belong in the ML container.
+                args.extend(("--env-file", str(CONFIG.parent / (self.app["name"] + "-machine-learning.env"))))
+            name = self.component_name(component)
+            command("systemd-run", "--scope", "--quiet", "--collect", "--slice=machine.slice",
+                    "--unit=" + name + "-" + uuid.uuid4().hex,
+                    "podman", "run", "--detach", "--name", name, "--pull=never",
+                    "--restart=always", "--log-driver=none", "--health-cmd=none",
+                    *args, generation["image"][component], *tail, timeout=180)
+
+    def healthy(self):
+        try:
+            for component in self.components:
+                info = self.inspect(self.component_name(component))
+                if not info or not info["State"]["Running"]:
+                    return False
+            if command("podman", "exec", self.component_name("database"),
+                       "pg_isready", "--username=postgres", "--dbname=immich", check=False, timeout=10):
+                return False
+            if command("podman", "exec", self.component_name("redis"), "valkey-cli", "ping", timeout=10) != "PONG":
+                return False
+            if command("podman", "exec", self.component_name("machine-learning"),
+                       "python3", "healthcheck.py", check=False, timeout=10):
+                return False
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://127.0.0.1:{self.app['settings']['web_port']}/api/server/ping", timeout=5) as response:
+                return response.status == 200 and json.load(response).get("res") == "pong"
+        except (OSError, ValueError, RuntimeError, AttributeError, subprocess.TimeoutExpired):
+            return False
+
+
+class SeafileApp(GroupApp):
+    """Seafile, MariaDB and Redis share one update and rollback boundary."""
+    components = ("server", "redis", "database")
+    mounts = {"server": ("shared", "/shared"), "redis": ("redis", "/data"),
+              "database": ("mysql", "/var/lib/mysql")}
+
+    def server_url(self):
+        configured = self.app["settings"]["server_url"]
+        if configured is not None:
+            return configured.rstrip("/")
+        # Derive the LAN address only at first installation. Seafile persists
+        # absolute download URLs, so use a DHCP reservation for this address.
+        address = self.config["network"]["address"]
+        if address:
+            host = address.split("/")[0]
+        else:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((self.config["network"]["host_dns"][0], 53))
+                host = sock.getsockname()[0]
+        port = self.app["settings"]["web_port"]
+        return "http://" + host + ("" if port == 80 else ":" + str(port))
+
+    def seed(self, directory, image=None):
+        for folder, _ in self.mounts.values():
+            (directory / folder).mkdir(mode=0o700)
+        # Nginx workers traverse /shared to serve avatars/custom static files.
+        # The enclosing generation stays private on the host.
+        (directory / "shared").chmod(0o755)
+        super().seed(directory / "shared", image)
+        s = self.app["settings"]
+        # Keep first-login credentials accessible even after generation cleanup,
+        # and stable when an interrupted first installation is retried.
+        credentials = self.root / "initial-admin.json"
+        if credentials.exists():
+            admin = json.loads(credentials.read_text())
+        else:
+            admin = {"email": s["admin_email"] or "admin@" + self.config["hostname"] + ".local",
+                     "password": s["admin_password"] or secrets.token_urlsafe(32)}
+            atomic_json(credentials, admin)
+        parsed = urlsplit(self.server_url())
+        root_password, password, jwt = (secrets.token_urlsafe(32) for _ in range(3))
+        env = {
+            "SEAFILE_SERVER_HOSTNAME": parsed.netloc, "SEAFILE_SERVER_PROTOCOL": parsed.scheme,
+            "INIT_SEAFILE_ADMIN_EMAIL": admin["email"], "INIT_SEAFILE_ADMIN_PASSWORD": admin["password"],
+            "INIT_SEAFILE_MYSQL_ROOT_PASSWORD": root_password,
+            "SEAFILE_MYSQL_DB_PASSWORD": password, "JWT_PRIVATE_KEY": jwt,
+        }
+        for name, values in {
+            "server.env": env,
+            "database.env": {"MYSQL_ROOT_PASSWORD": root_password, "MYSQL_ROOT_HOST": "%",
+                             "MYSQL_LOG_CONSOLE": "true", "MARIADB_AUTO_UPGRADE": "1"},
+        }.items():
+            path = directory / name
+            path.write_text("".join(key + "=" + value + "\n" for key, value in values.items()))
+            path.chmod(0o600)
+
+    def database_ready(self):
+        return command("podman", "exec", self.component_name("database"), "healthcheck.sh",
+                       "--connect", "--mariadbupgrade", "--innodb_initialized", check=False, timeout=10) == 0
+
+    def start(self, generation):
+        directory = self.data(generation)
+        if not all((directory / folder).is_dir() for folder, _ in self.mounts.values()) or not all(
+            (directory / name).is_file() for name in ("server.env", "database.env")
+        ):
+            raise RuntimeError("Generation data missing; refusing an empty replacement")
+        self.stop()
+        self.remove()
+        network = self.name + "-network"
+        command("podman", "network", "create", "--ignore", network)
+        for component in reversed(self.components):
+            folder, target = self.mounts[component]
+            args = ["--network", network, "--network-alias", component,
+                    "--volume", f"{directory / folder}:{target}:Z"]
+            tail = []
+            if component == "database":
+                args.extend(("--env-file", str(directory / "database.env")))
+            elif component == "redis":
+                # Cache is disposable; keep the server off the host network.
+                tail = ["redis-server", "--save", "", "--appendonly", "no"]
+            else:
+                args.extend(("--publish", f"{self.app['settings']['web_port']}:80/tcp",
+                             "--env-file", str(CONFIG.parent / (self.app["name"] + ".env")),
+                             "--env-file", str(directory / "server.env")))
+            name = self.component_name(component)
+            command("systemd-run", "--scope", "--quiet", "--collect", "--slice=machine.slice",
+                    "--unit=" + name + "-" + uuid.uuid4().hex,
+                    "podman", "run", "--detach", "--name", name, "--pull=never",
+                    "--restart=always", "--log-driver=none", "--health-cmd=none",
+                    *args, generation["image"][component], *tail, timeout=180)
+            if component == "database":
+                deadline = time.monotonic() + self.config["updates"]["health_timeout_seconds"]
+                while not self.database_ready():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Seafile database failed startup health checks")
+                    time.sleep(5)
+
+    def healthy(self):
+        try:
+            for component in self.components:
+                info = self.inspect(self.component_name(component))
+                if not info or not info["State"]["Running"]:
+                    return False
+            if not self.database_ready():
+                return False
+            if command("podman", "exec", self.component_name("redis"), "redis-cli", "ping", timeout=10) != "PONG":
+                return False
+            # Check the published port locally even when public HTTPS terminates
+            # upstream. The Host header matches Seafile's configured authority.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            authority = urlsplit(self.server_url()).netloc
+            def probe(path):
+                request = urllib.request.Request(f"http://127.0.0.1:{self.app['settings']['web_port']}" + path,
+                                                 headers={"Host": authority, "Accept": "application/json"})
+                with opener.open(request, timeout=5) as response:
+                    return json.load(response) if response.status == 200 else None
+            return probe("/api2/ping/") == "pong" and probe("/seafhttp/protocol-version").get("version") == 2
+        except (OSError, ValueError, RuntimeError, AttributeError, subprocess.TimeoutExpired):
+            return False
 
 
 class Status:
@@ -449,7 +716,8 @@ class Status:
 
 
 def operate(config, action, root=ROOT):
-    apps = [App(config, a, root) for a in config["apps"] if a["enabled"]]
+    apps = [{"immich": ImmichApp, "seafile": SeafileApp}.get(a["kind"], App)(config, a, root)
+            for a in config["apps"] if a["enabled"]]
     status = Status(config, root)
     if action == "check":
         # A fresh installation has no accepted baseline to roll the OS back to.

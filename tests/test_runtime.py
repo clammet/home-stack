@@ -190,7 +190,7 @@ class DeploymentTests(unittest.TestCase):
                 raise RuntimeError('candidate unhealthy')
         with patch.object(runtime.App, 'update', update):
             self.assertEqual(runtime.operate(self.config, 'update', self.root), 1)
-        self.assertEqual(visited, ['pihole', 'homeassistant'])
+        self.assertEqual(visited, ['pihole', 'homeassistant', 'immich', 'seafile'])
         faults = json.loads((self.root / 'status.json').read_text())['faults']
         self.assertEqual(list(faults), ['pihole:update'])
 

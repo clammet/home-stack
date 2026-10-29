@@ -1,0 +1,49 @@
+{
+  "hostname": "example-appliance",
+  "timezone": "Etc/UTC",
+  "ssh_authorized_keys": [],
+  "apps": [
+    {
+      "name": "dns",
+      "kind": "pihole",
+      "settings": {
+        "admin_password": {
+          "secret_file": "secrets/dns-admin.secret"
+        }
+      }
+    },
+    {
+      "name": "broker",
+      "kind": "mosquitto",
+      "settings": {
+        "users": [
+          {
+            "username": "example-client",
+            "password": {
+              "secret_file": "secrets/mqtt.secret"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "assistant",
+      "kind": "homeassistant",
+      "auto_update": false,
+      "seed": "homeassistant",
+      "setup": "homeassistant-setup.json"
+    },
+    {
+      "name": "photos",
+      "kind": "immich",
+      "auto_update": true,
+      "settings": {"web_port": 2283, "config_file": null}
+    },
+    {
+      "name": "files",
+      "kind": "seafile",
+      "auto_update": true,
+      "settings": {"web_port": 8080, "server_url": null}
+    }
+  ]
+}

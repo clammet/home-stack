@@ -17,6 +17,7 @@ import urllib.parse
 from .config import load
 from .provision import render
 from .targets import UPSTREAM_BASE, validate_elf, validate_container
+from runtime.images import deployment_name, image_references
 
 MIB = 1024 * 1024
 
@@ -162,6 +163,23 @@ def requirements():
         raise ValueError("Missing build tools: " + ", ".join(missing))
 
 
+def bundle_containers(config, archives):
+    containers = {}
+    for app in config["apps"]:
+        if not app["enabled"]:
+            continue
+        for component, reference in image_references(app).items():
+            name = deployment_name(app, component)
+            archive = archives / (name + ".tar")
+            print(f"Fetching linux/arm64 container: {name}", flush=True)
+            run("skopeo", "copy", "--override-os", "linux", "--override-arch", "arm64",
+                "docker://" + reference,
+                f"docker-archive:{archive}:localhost/home-stack-{name}:build")
+            validate_container(json.loads(run("skopeo", "inspect", "--config", f"docker-archive:{archive}")))
+            containers[name] = {"reference": reference, "archive_sha256": checksum(archive)}
+    return containers
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     inputs = parser.add_mutually_exclusive_group()
@@ -228,17 +246,7 @@ def main():
             render(config, combustion)
             archives = workspace / "archives"
             archives.mkdir()
-            containers = {}
-            for app in config["apps"]:
-                if not app["enabled"]:
-                    continue
-                archive = archives / (app["name"] + ".tar")
-                print(f"Fetching linux/arm64 container: {app['name']}", flush=True)
-                run("skopeo", "copy", "--override-os", "linux", "--override-arch", "arm64",
-                    "docker://" + app["image"],
-                    f"docker-archive:{archive}:localhost/home-stack-{app['name']}:build")
-                validate_container(json.loads(run("skopeo", "inspect", "--config", f"docker-archive:{archive}")))
-                containers[app["name"]] = {"reference": app["image"], "archive_sha256": checksum(archive)}
+            containers = bundle_containers(config, archives)
             assemble(raw, combustion, config["image_size_mib"], workspace, archives)
             image_sum = checksum(raw)
             metadata = workspace / "image.img.json"
