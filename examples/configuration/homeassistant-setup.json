@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "owner": {
+    "name": "Example Owner",
+    "username": "example-admin",
+    "language": "en",
+    "password": {
+      "secret_file": "secrets/owner.secret"
+    }
+  },
+  "integrations": [
+    {
+      "key": "example-broker",
+      "domain": "mqtt",
+      "steps": {
+        "broker": {
+          "broker": "127.0.0.1",
+          "port": 1883,
+          "username": "example-client",
+          "password": {
+            "secret_file": "secrets/mqtt.secret"
+          }
+        }
+      }
+    }
+  ],
+  "floors": [
+    {
+      "key": "example-floor",
+      "name": "Example Floor",
+      "level": 1
+    }
+  ],
+  "areas": [
+    {
+      "key": "example-room",
+      "name": "Example Room",
+      "floor_id": "example-floor"
+    }
+  ],
+  "devices": [],
+  "entities": [],
+  "device_settings": []
+}

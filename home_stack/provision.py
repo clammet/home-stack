@@ -77,6 +77,7 @@ dns-priority=-100
     for app in apps:
         write(payload, app["name"] + ".env", "".join(f"{k}={v}\n" for k, v in environment(config, app).items()))
     shutil.copyfile(RUNTIME, payload / "controller.py")
+    shutil.copyfile(RUNTIME.with_name("ha_setup.py"), payload / "ha_setup.py")
     write(payload, "authorized_keys", "\n".join(config["ssh_authorized_keys"]) + "\n")
     write(payload, "journald.conf", f"""[Journal]
 Storage={config['logging']['storage']}
@@ -132,7 +133,7 @@ mountpoint -q /var || mount /var
 mountpoint -q /usr/local || mount /usr/local
 install -d -m 700 /etc/home-stack /var/lib/home-stack
 install -m 600 payload/config.json payload/*.env /etc/home-stack/
-install -m 644 payload/controller.py /etc/home-stack/
+install -m 644 payload/controller.py payload/ha_setup.py /etc/home-stack/
 install -m 644 payload/units/* /etc/systemd/system/
 printf '%s\\n' {shlex.quote(config['hostname'])} > /etc/hostname
 ln -snf {shlex.quote('/usr/share/zoneinfo/' + config['timezone'])} /etc/localtime
@@ -170,6 +171,8 @@ printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\nPermitRoot
         ports = app["ports"]
         if app["kind"] == "pihole":
             ports = ["53:53/tcp", "53:53/udp", f"{app['settings']['web_port']}:80/tcp"]
+        elif app["kind"] == "mosquitto":
+            ports = ["1883:1883/tcp"]
         elif app["kind"] == "homeassistant":
             ports = ["8123:8123/tcp", "5353:5353/udp", "1900:1900/udp"]
         elif app["network"] == "host":

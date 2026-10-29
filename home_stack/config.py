@@ -2,13 +2,16 @@
 import copy
 import ipaddress
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import os
+
+from .config_directory import expand, validate_setup
 import re
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULTS = {
-    "hostname": "home-stack", "timezone": "Australia/Melbourne", "image_size_mib": 32768,
+    "hostname": "home-stack", "timezone": "Etc/UTC", "image_size_mib": 32768,
     "ssh_authorized_keys": [],
     "network": {"interface": None, "address": None, "gateway": None,
                 "host_dns": ["1.1.1.1", "9.9.9.9"]},
@@ -22,7 +25,8 @@ DEFAULTS = {
 }
 COMMON = {"name": "", "kind": "container", "enabled": True, "auto_update": True,
           "image": "", "environment": {}, "ports": [], "network": "bridge",
-          "data_path": "/data", "privileged": False, "health": {}, "settings": {}}
+          "data_path": "/data", "privileged": False, "health": {}, "settings": {},
+          "seed": None, "setup": None}
 PRESETS = {
     "pihole": {"image": "docker.io/pihole/pihole:latest", "data_path": "/etc/pihole",
                "settings": {"admin_password": "", "web_port": 80,
@@ -31,6 +35,9 @@ PRESETS = {
                             "cache_optimizer": 3600, "web_session_timeout": 1800}},
     "homeassistant": {"image": "ghcr.io/home-assistant/home-assistant:stable",
                       "network": "host", "privileged": True, "data_path": "/config"},
+    "mosquitto": {"image": "docker.io/eclipse-mosquitto:2",
+                  "data_path": os.path.join(os.sep, "mosquitto"),
+                  "settings": {"users": []}},
     "container": {},
 }
 
@@ -87,12 +94,12 @@ def url(value, name, https=False):
 
 def app_config(raw):
     if not isinstance(raw, dict) or not isinstance(raw.get("kind"), str) or raw["kind"] not in PRESETS:
-        raise ValueError("Each app requires kind: pihole, homeassistant, or container")
+        raise ValueError("Each app requires kind: pihole, homeassistant, mosquitto, or container")
     kind = raw["kind"]
     base = copy.deepcopy(COMMON)
     base.update(copy.deepcopy(PRESETS[kind]))
     # Environment and generic health have dynamic keys, validated separately.
-    dynamic = {k: raw[k] for k in ("environment", "health") if k in raw}
+    dynamic = {k: raw[k] for k in ("environment", "health", "seed", "setup") if k in raw}
     app = merge(base, {k: v for k, v in raw.items() if k not in dynamic}, "apps.")
     app.update(dynamic)
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", line(app["name"], "app name")):
@@ -165,6 +172,29 @@ def app_config(raw):
             integer(h["port"], 1, 65535, "health.port")
         else:
             raise ValueError("Generic container requires HTTP url or TCP port health check")
+    if app["kind"] == "mosquitto":
+        users = app["settings"]["users"]
+        if not isinstance(users, list) or not users:
+            raise ValueError("Mosquitto requires at least one password-authenticated user")
+        names = set()
+        for user in users:
+            if not isinstance(user, dict) or set(user) != {"username", "password"}:
+                raise ValueError("Mosquitto users require username and password")
+            name = line(user["username"], "MQTT username")
+            line(user["password"], "MQTT password")
+            if name in names or ":" in name:
+                raise ValueError("MQTT usernames must be unique and passwords nonempty")
+            names.add(name)
+    if app["seed"] is not None:
+        from .config_directory import seed_files
+        seed_files(Path.cwd(), app["seed"])
+    if app["setup"] is not None:
+        if kind != "homeassistant":
+            raise ValueError("Only Home Assistant supports setup")
+        validate_setup(app["setup"])
+        automation = app["setup"].get("automations")
+        if automation and automation["source"] not in (app.get("seed") or {}).get("files", {}):
+            raise ValueError("Automation activation source is missing from the seed")
     return app
 
 
@@ -183,6 +213,7 @@ def load(path=None, overrides=()):
             if not isinstance(node, dict):
                 raise ValueError("Override path must traverse objects")
         node[parts[-1]] = json.loads(value)
+    raw = expand(raw, path.parent if path else Path.cwd())
     config = merge(DEFAULTS, raw)
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", line(config["hostname"], "hostname")):
         raise ValueError("Invalid hostname")
@@ -241,6 +272,8 @@ def load(path=None, overrides=()):
         bindings = app["ports"]
         if kind == "pihole":
             bindings = ["53:53/tcp", "53:53/udp", f"{app['settings']['web_port']}:80/tcp"]
+        if kind == "mosquitto":
+            bindings = ["1883:1883/tcp"]
         if kind == "homeassistant":
             bindings = ["8123:8123/tcp"]
         for binding in bindings:

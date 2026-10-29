@@ -1,0 +1,13 @@
+default_config:
+homeassistant:
+  name: Example House
+  time_zone: Etc/UTC
+  unit_system: metric
+logger:
+  default: warning
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+input_boolean:
+  example_indicator:
+    name: Example indicator

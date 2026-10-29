@@ -1,6 +1,6 @@
 {
   "hostname": "home-stack",
-  "timezone": "Australia/Melbourne",
+  "timezone": "Etc/UTC",
   "image_size_mib": 32768,
   "ssh_authorized_keys": [],
   "network": {

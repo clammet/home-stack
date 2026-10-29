@@ -6,7 +6,9 @@ Build an ARM64 openSUSE MicroOS appliance for a Raspberry Pi 5 with an NVMe HAT.
 
 ## Build
 
-Python 3.9+ is required. Start with:
+Python 3.9+ is required. For a private configuration directory, start with `examples/configuration/` and build with `--config-dir ../my-private-appliance`. The directory holds JSON, application seed files and explicitly referenced secret files; it is never copied wholesale. See [configuration directories and HA initialization](docs/configuration-directory.md).
+
+The legacy single-file configuration also remains supported. Start with:
 
 ```sh
 cp config.example.json config.json
@@ -48,7 +50,7 @@ The default raw image is 32 GiB. Its root is expanded during assembly; the final
 
 Write the image with Raspberry Pi Imager's **Use custom** option, without Raspberry Pi OS customization. This builder never writes a physical disk. See [network installation](docs/network-install.md) for installing directly to NVMe without an SD card.
 
-After first boot, open Pi-hole at `http://<pi-address>/admin/` and Home Assistant at `http://<pi-address>:8123/`. Complete Home Assistant onboarding and configure your integrations once. This is Home Assistant Container, without the Home Assistant OS/Supervisor app store. It uses host networking and privileged access for hardware, following the upstream container deployment model; Podman compatibility still needs appliance validation. [Home Assistant installation](https://www.home-assistant.io/installation/linux/)
+After first boot, open Pi-hole at `http://<pi-address>/admin/` and Home Assistant at `http://<pi-address>:8123/`. A Home Assistant setup manifest can create the owner, configure integrations and rooms, and apply initial settings automatically. Without a manifest, complete normal onboarding. Zigbee device joining still requires commissioning. This is Home Assistant Container, without the Home Assistant OS/Supervisor app store. It uses host networking and privileged access for hardware, following the upstream container deployment model; Podman compatibility still needs appliance validation. [Home Assistant installation](https://www.home-assistant.io/installation/linux/)
 
 After verifying DNS, configure your router to advertise the Pi as the clients' DNS server. A public secondary DNS server can bypass blocking even while Pi-hole is healthy; it is not guaranteed to be used only during failure.
 
@@ -58,11 +60,13 @@ After verifying DNS, configure your router to advertise the Pi as the clients' D
 
 | Setting | Behaviour |
 | --- | --- |
-| `apps` | Array of deployments; `name` must be unique and `kind` is `pihole`, `homeassistant`, or `container` |
+| `apps` | Array of deployments; `name` must be unique and `kind` is `pihole`, `homeassistant`, `mosquitto`, or `container` |
 | `apps[].image` | Fully qualified image reference; use a moving tag for automatic releases or a digest to pin |
 | `apps[].enabled` | Defaults to true; disabled apps are not bundled or deployed |
 | `apps[].auto_update` | Defaults to true; false retains boot/recovery checks but disables automatic image pulls |
 | `apps[].environment` | Additional string environment values; managed preset values cannot be overridden |
+| `apps[].seed` | Initial data directory, optionally with explicitly named private overlays; never reapplied during ordinary updates |
+| `apps[].setup` | Home Assistant version-1 first-install manifest; resumable onboarding/integration/registry initialization |
 | `apps[].settings` | Pi-hole password, HTTP port, upstream DNS, DNSSEC, domain-name forwarding policy, cache optimizer, web session timeout, optional initial adlists and local DNS records |
 | `network` | Wired interface (`null` selects Ethernet automatically; explicit names such as `end0` also work), optional static IPv4 address/gateway, independent host DNS |
 | `updates` | Container/OS systemd calendars, jitter, health probation, failed-image cooldown |

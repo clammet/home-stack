@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Crash-recoverable multi-container updates. Uses only the Python standard library."""
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -165,6 +166,8 @@ class App:
             for path, options in (("/var/log", "size=16m,mode=0755"), ("/run", "size=16m,mode=0755"),
                                   ("/tmp", "size=128m,mode=1777"), ("/var/tmp", "size=16m,mode=1777")):
                 args.extend(("--tmpfs", f"{path}:rw,nosuid,nodev,{options}"))
+        elif a["kind"] == "mosquitto":
+            ports = ["1883:1883/tcp"]
         elif a["kind"] == "homeassistant":
             # Host D-Bus must not be relabelled; the upstream container requires host privileges.
             args.extend(("--volume", "/run/dbus:/run/dbus:ro"))
@@ -187,6 +190,9 @@ class App:
                 if not dns_probe() or not dns_probe(tcp=True):
                     return False
                 url = f"http://127.0.0.1:{self.app['settings']['web_port']}/admin/"
+            elif kind == "mosquitto":
+                with socket.create_connection(("127.0.0.1", 1883), timeout=5):
+                    return True
             elif kind == "homeassistant":
                 url = "http://127.0.0.1:8123/"
             elif self.app["health"]["kind"] == "tcp":
@@ -213,13 +219,71 @@ class App:
     def image(self, reference):
         return json.loads(command("podman", "image", "inspect", reference, timeout=30))[0]["Id"]
 
-    def seed(self, directory):
+    def seed(self, directory, image=None):
         if self.app["kind"] == "pihole":
             lists = self.app["settings"]["adlists"]
             if lists is not None:
                 (directory / "adlists.list").write_text("".join(item + "\n" for item in lists))
         elif self.app["kind"] == "homeassistant":
-            (directory / "configuration.yaml").write_text("default_config:\nlogger:\n  default: warning\n")
+            (directory / "configuration.yaml").write_text("default_config:\nlogger:\n  default: warning\nautomation: !include automations.yaml\nscript: !include scripts.yaml\nscene: !include scenes.yaml\n")
+            for name, content in (("automations.yaml", "[]\n"), ("scripts.yaml", "{}\n"), ("scenes.yaml", "[]\n")):
+                (directory / name).write_text(content)
+        elif self.app["kind"] == "mosquitto":
+            root = Path(self.app["data_path"])
+            for name in ("config", "data"):
+                (directory / name).mkdir()
+            configuration = ("listener 1883 0.0.0.0\nallow_anonymous false\n"
+                             f"password_file {root / 'config' / 'passwords'}\n"
+                             f"persistence true\npersistence_location {root / 'data'}/\n"
+                             "autosave_interval 300\nlog_dest stdout\nlog_type error\nlog_type warning\n")
+            (directory / "config" / "mosquitto.conf").write_text(configuration)
+            passwords = directory / "config" / "passwords"
+            passwords.write_text("".join(user["username"] + ":" + user["password"] + "\n"
+                                         for user in self.app["settings"]["users"]))
+            passwords.chmod(0o600)
+            # Convert the private temporary plaintext file in place; secrets never
+            # appear in argv, stdout, or the process environment.
+            try:
+                command("podman", "run", "--rm", "--network=none", "--user=0",
+                        "--entrypoint=mosquitto_passwd", "--volume", f"{directory}:{root}:Z",
+                        image or self.image(self.app["image"]), "-H", "sha512-pbkdf2", "-U",
+                        str(root / "config" / "passwords"))
+            except BaseException:
+                passwords.unlink(missing_ok=True)
+                raise
+        for name, encoded in (self.app.get("seed") or {}).get("files", {}).items():
+            # Build-time validation is repeated at the write boundary.
+            relative = Path(name)
+            if relative.is_absolute() or ".." in relative.parts or any(p.startswith(".") for p in relative.parts):
+                raise ValueError("Invalid seed filename")
+            target = directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(base64.b64decode(encoded, validate=True))
+            target.chmod(0o600)
+        if self.app["kind"] == "mosquitto":
+            for path in [directory, *directory.rglob("*")]:
+                os.chown(path, 1883, 1883)
+                path.chmod(0o750 if path.is_dir() else 0o640)
+
+    def setup(self):
+        if self.app["kind"] != "homeassistant" or not self.app.get("setup"):
+            return
+        # The running HA image supplies aiohttp; no additional host packages.
+        result = subprocess.run(
+            ["podman", "exec", "--interactive", self.name, "python", "-c",
+             (CONFIG.parent / "ha_setup.py").read_text()],
+            input=json.dumps(self.app["setup"]), text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=120)
+        try:
+            progress = json.loads(result.stdout)
+            if result.returncode or progress.get("status") not in ("waiting", "complete", "error"):
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise RuntimeError("Home Assistant initialization failed; no private output was logged") from None
+        atomic_json(self.root / "setup.json", progress)
+        if progress["status"] == "error":
+            raise RuntimeError("Home Assistant initialization needs attention; see setup status codes")
+
 
     def rollback_pending(self):
         pending = self.state["pending"]
@@ -246,7 +310,7 @@ class App:
                 command("cp", "--archive", "--reflink=auto", str(self.data(old)), str(self.data(candidate)))
             else:
                 self.data(candidate).mkdir(mode=0o700)
-                self.seed(self.data(candidate))
+                self.seed(self.data(candidate), image)
             os.sync()
             self.state["pending"] = candidate
             self.save()  # journal is durable before any candidate touches its database
@@ -396,7 +460,8 @@ def operate(config, action, root=ROOT):
         return 0
     if action == "status":
         print(json.dumps({"faults": status.state["faults"], "apps": {
-            a.app["name"]: {"healthy": a.healthy(), "active": a.state["active"], "pending": a.state["pending"]} for a in apps}}, indent=2))
+            a.app["name"]: {"healthy": a.healthy(), "active": a.state["active"], "pending": a.state["pending"],
+                              "setup": json.loads((a.root / "setup.json").read_text()) if (a.root / "setup.json").exists() else None} for a in apps}}, indent=2))
         return int(bool(status.state["faults"]))
     if action == "os-update":
         if any(not a.state["active"] or not a.healthy() for a in apps):
@@ -423,6 +488,12 @@ def operate(config, action, root=ROOT):
             else:
                 app.reconcile()
             status.record(name + ":runtime")
+            try:
+                app.setup()
+                status.record(name + ":setup")
+            except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+                failed = True
+                status.record(name + ":setup", "Home Assistant initialization needs attention; see setup status")
         except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
             failed = True
             # Runtime exceptions never include command output/environment secrets.

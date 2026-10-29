@@ -154,7 +154,9 @@ def positive(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=REPO / "config.json")
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--config", type=Path)
+    inputs.add_argument("--config-dir", type=Path, help="Configuration directory containing config.json, seeds, and private secret references")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=JSON")
     parser.add_argument("--output", type=Path, default=REPO / "dist/home-stack-pi5.img")
     parser.add_argument("--base-image", type=Path)
@@ -169,7 +171,7 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        config = None if args.check_vm else load(args.config, args.set)
+        config = None if args.check_vm else load((args.config_dir / "config.json") if args.config_dir else (args.config or REPO / "config.json"), args.set)
         args.output = args.output.absolute()
         if not args.check_vm:
             if sum(bool(v) for v in (args.base_image, args.base_url, args.experimental_upstream)) != 1:
