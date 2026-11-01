@@ -41,9 +41,9 @@
     },
     {
       "name": "files",
-      "kind": "seafile",
+      "kind": "opencloud",
       "auto_update": true,
-      "settings": {"web_port": 8080, "server_url": null}
+      "settings": {"web_port": 9200, "server_url": null}
     }
   ]
 }

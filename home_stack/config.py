@@ -6,9 +6,9 @@ import json
 from pathlib import Path, PurePosixPath
 import os
 
-from .config_directory import expand, validate_setup
-from runtime.images import (IMMICH_DATABASE, IMMICH_REDIS, SEAFILE_DATABASE, SEAFILE_REDIS,
-                            deployment_name, image_references)
+from .config_directory import expand, unifi_backup, validate_setup
+from runtime.images import (IMMICH_DATABASE, IMMICH_REDIS,
+                            deployment_name, image_references, unifi_ports)
 import re
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,7 +26,7 @@ DEFAULTS = {
     "apps": [{"name": "pihole", "kind": "pihole"},
              {"name": "homeassistant", "kind": "homeassistant"},
              {"name": "immich", "kind": "immich"},
-             {"name": "seafile", "kind": "seafile"}],
+             {"name": "opencloud", "kind": "opencloud"}],
 }
 COMMON = {"name": "", "kind": "container", "enabled": True, "auto_update": True,
           "image": "", "environment": {}, "ports": [], "network": "bridge",
@@ -47,10 +47,12 @@ PRESETS = {
                "settings": {"web_port": 2283, "config_file": None,
                             "machine_learning_image": None,
                             "database_image": IMMICH_DATABASE, "redis_image": IMMICH_REDIS}},
-    "seafile": {"image": "docker.io/seafileltd/seafile-mc:13.0-latest", "data_path": "/shared",
-                "settings": {"web_port": 8080, "server_url": None,
-                             "admin_email": None, "admin_password": None,
-                             "database_image": SEAFILE_DATABASE, "redis_image": SEAFILE_REDIS}},
+    "opencloud": {"image": "docker.io/opencloudeu/opencloud:latest", "data_path": "/var/lib/opencloud",
+                  "settings": {"web_port": 9200, "server_url": None, "admin_password": None,
+                               "proxy_tls": True, "insecure": True}},
+    "unifi": {"image": "docker.io/jacobalberty/unifi:latest", "data_path": "/unifi",
+              "settings": {"web_port": 8443, "backup": None, "guest_portal": False,
+                           "inform_host": None}},
     "container": {},
 }
 
@@ -107,7 +109,7 @@ def url(value, name, https=False):
 
 def app_config(raw):
     if not isinstance(raw, dict) or not isinstance(raw.get("kind"), str) or raw["kind"] not in PRESETS:
-        raise ValueError("Each app requires kind: pihole, homeassistant, mosquitto, immich, seafile, or container")
+        raise ValueError("Each app requires kind: pihole, homeassistant, mosquitto, immich, opencloud, unifi, or container")
     kind = raw["kind"]
     base = copy.deepcopy(COMMON)
     base.update(copy.deepcopy(PRESETS[kind]))
@@ -143,11 +145,16 @@ def app_config(raw):
             "IMMICH_WORKERS_INCLUDE", "IMMICH_WORKERS_EXCLUDE", "CREDENTIALS_DIRECTORY",
             "MACHINE_LEARNING_CACHE_FOLDER", "TRANSFORMERS_CACHE"}):
             raise ValueError("Immich connection, worker, mount and port environment values are managed")
-        if kind == "seafile" and (key.startswith(("SEAFILE_", "INIT_SEAFILE_", "MYSQL_", "MARIADB_",
-                                                  "REDIS_", "MEMCACHED_", "ENABLE_", "CLUSTER_")) or key in {
-            "TIME_ZONE", "JWT_PRIVATE_KEY", "CACHE_PROVIDER", "SITE_ROOT", "NON_ROOT",
-            "SERVER_NAME", "SERVER_IP", "CCNET_DB", "SEAFILE_DB", "SEAHUB_DB"}):
-            raise ValueError("Seafile connection, initialization and feature environment values are managed")
+        if kind == "opencloud" and (key.startswith(("OC_", "PROXY_", "IDM_", "IDP_", "STORAGE_",
+                                                    "WEB_", "NATS_", "MICRO_", "GATEWAY_", "FRONTEND_"))
+                                    or key == "ADMIN_PASSWORD") and key not in {
+                                        "OC_LOG_LEVEL", "OC_LOG_COLOR", "OC_LOG_PRETTY", "OC_DEFAULT_LANGUAGE"}:
+            raise ValueError("OpenCloud storage, identity, networking and initialization environment values are managed")
+        if kind == "unifi" and (key.startswith(("UNIFI_", "MONGO", "PORTAL_")) or key in {
+            "BASEDIR", "DATADIR", "LOGDIR", "CERTDIR", "RUNDIR", "ORUNDIR", "ODATADIR", "OLOGDIR",
+            "DB_URI", "STATDB_URI", "DB_NAME", "SYSTEM_IP", "RUNAS_UID0", "BIND_PRIV", "UNSAFE_IO",
+            "LOTSOFDEVICES", "JVM_EXTRA_OPTS", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "PKGURL"}):
+            raise ValueError("UniFi database, paths, ports and initialization environment values are managed")
     strings(app["ports"], "ports")
     for port in app["ports"]:
         match = re.fullmatch(r"(\d+):(\d+)/(tcp|udp)", port)
@@ -177,27 +184,43 @@ def app_config(raw):
                 raise ValueError("Immich config_file must contain valid JSON") from None
             if not isinstance(value, dict):
                 raise ValueError("Immich config_file must contain a JSON object")
-    if kind == "seafile":
+    if kind == "unifi":
         s = app["settings"]
-        integer(s["web_port"], 1, 65535, "seafile.web_port")
+        integer(s["web_port"], 1, 65535, "unifi.web_port")
+        if type(s["guest_portal"]) is not bool:
+            raise ValueError("unifi.guest_portal must be boolean")
+        if s["inform_host"] is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9.-]*", line(s["inform_host"], "unifi.inform_host")
+        ):
+            raise ValueError("unifi.inform_host must be an IPv4 address or hostname")
+        # expand() compiled relative inputs before validation; direct app_config
+        # calls may only provide an already compiled backup.
+        if isinstance(s["backup"], str):
+            raise ValueError("UniFi backup must be resolved by the configuration loader")
+        s["backup"] = unifi_backup(Path.cwd(), s["backup"])
+        if app["seed"] is not None:
+            raise ValueError("UniFi initialization uses settings.backup, not data directory seeds")
+    if kind == "opencloud":
+        s = app["settings"]
+        integer(s["web_port"], 1, 65535, "opencloud.web_port")
+        for key in ("proxy_tls", "insecure"):
+            if type(s[key]) is not bool:
+                raise ValueError(f"opencloud.{key} must be boolean")
         if s["server_url"] is not None:
-            parsed = url(s["server_url"], "seafile.server_url")
-            # The container interpolates this authority into generated config.
+            parsed = url(s["server_url"], "opencloud.server_url", https=True)
             if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]+)?", parsed.netloc)
                     or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
-                raise ValueError("seafile.server_url requires a hostname/IPv4 URL without a path")
+                raise ValueError("opencloud.server_url requires a hostname/IPv4 HTTPS URL without a path")
             if parsed.port is not None:
-                integer(parsed.port, 1, 65535, "seafile.server_url port")
-        if (s["admin_email"] is None) != (s["admin_password"] is None):
-            raise ValueError("Seafile admin_email and admin_password must be supplied together")
-        if s["admin_email"] is not None:
-            if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", line(s["admin_email"], "seafile.admin_email")):
-                raise ValueError("Invalid Seafile admin_email")
-            if len(line(s["admin_password"], "seafile.admin_password")) < 12:
-                raise ValueError("Seafile admin_password must contain at least 12 characters")
-        # Partial shared-volume seeds can suppress upstream config/DB creation.
+                integer(parsed.port, 1, 65535, "opencloud.server_url port")
+        if not s["proxy_tls"] and s["server_url"] is None:
+            raise ValueError("OpenCloud without proxy_tls requires an explicit HTTPS server_url for the reverse proxy")
+        if s["proxy_tls"] and not s["insecure"]:
+            raise ValueError("OpenCloud's generated certificate requires insecure; use a trusted HTTPS reverse proxy otherwise")
+        if s["admin_password"] is not None and len(line(s["admin_password"], "opencloud.admin_password")) < 12:
+            raise ValueError("OpenCloud admin_password must contain at least 12 characters")
         if app["seed"] is not None:
-            raise ValueError("Seafile initialization uses settings, not partial shared-volume seeds")
+            raise ValueError("OpenCloud initialization uses settings, not partial configuration/data seeds")
     if kind == "pihole":
         p = app["settings"]
         if len(line(p["admin_password"], "Pi-hole admin_password")) < 12:
@@ -344,8 +367,10 @@ def load(path=None, overrides=()):
             bindings = ["8123:8123/tcp"]
         if kind == "immich":
             bindings = [f"{app['settings']['web_port']}:2283/tcp"]
-        if kind == "seafile":
-            bindings = [f"{app['settings']['web_port']}:80/tcp"]
+        if kind == "opencloud":
+            bindings = [f"{app['settings']['web_port']}:9200/tcp"]
+        if kind == "unifi":
+            bindings = unifi_ports(app)
         for binding in bindings:
             host, _, protocol = re.split(r"[:/]", binding)
             pair = (int(host), protocol)

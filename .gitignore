@@ -1,6 +1,8 @@
 config.json
 !examples/configuration/config.json
 config.*.private.json
+*.unf
+*.unifi
 build/
 dist/
 downloads/

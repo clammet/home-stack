@@ -1,6 +1,6 @@
 # Configuration directories and first-install setup
 
-Keep appliance-specific inputs in a separate private directory. The builder never copies that checkout wholesale: it reads `config.json`, explicitly referenced secret/setup files, and the selected application seed trees. Git metadata, databases and hidden state are not accepted as seed inputs.
+Keep appliance-specific inputs in a separate private directory. The builder never copies that checkout wholesale: it reads `config.json`, explicitly referenced secret/setup files, UniFi backups, and the selected application seed trees. Git metadata, databases and hidden state are not accepted as seed inputs.
 
 ```sh
 python3 build.py --config-dir examples/configuration --render-only build/example
@@ -93,9 +93,13 @@ TCP availability does not prove authentication/discovery. Commission with a real
 
 The synthetic configuration enables Immich with normal onboarding and UI-managed settings. The `immich/immich-config.json` placeholder is inactive until you select `"seed": "immich"` and `"settings": {"config_file": "immich-config.json"}` on that app. File configuration is authoritative and disables editing Immich settings in the UI; it does not create an administrator. See [Immich](immich.md) for configuration options, grouped updates and storage requirements.
 
-## Seafile preset
+## OpenCloud preset
 
-The synthetic configuration also enables Seafile on port 8080. It initializes its own database and admin account, then presents its normal login page. Omit Seafile settings to generate private initial credentials, or configure `settings.server_url`, `settings.admin_email` and a `settings.admin_password` secret reference. Generic shared-volume seeds are rejected because partial configuration can bypass upstream initialization. See [Seafile first login, settings and grouped updates](seafile.md).
+The synthetic configuration also enables OpenCloud over HTTPS on port 9200. It initializes its embedded identity services and `admin` account before presenting the login page. Omit `settings.admin_password` to generate private initial credentials, or supply a secret reference. `settings.server_url` selects the canonical HTTPS URL; `proxy_tls` and `insecure` configure direct self-signed TLS or an existing HTTPS reverse proxy. Partial configuration/data seeds are rejected. See [OpenCloud first login, settings and updates](opencloud.md).
+
+## UniFi Network preset
+
+The optional `unifi` preset accepts `"settings": {"backup": "secrets/network.unf"}`. The path is relative to the configuration directory, must stay inside it, and cannot traverse symlinks. Backups are binary, nonempty `.unf` files of at most 128 MiB, with a separate size limit from text seeds. The loader embeds the exact bytes into the private configuration so they survive the macOS VM transfer without copying the private checkout. UniFi itself validates and restores the backup on the first data generation. Later restarts and updates preserve the restored database and UI edits. See [UniFi configuration and restoration](unifi.md).
 
 ## Validation
 

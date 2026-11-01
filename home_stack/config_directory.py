@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 
 MAX_FILE = 8 * 1024 * 1024
 MAX_SEED = 32 * 1024 * 1024
+MAX_UNIFI_BACKUP = 128 * 1024 * 1024
 
 
 def relative(value):
@@ -114,11 +115,41 @@ def seed_files(root, specification):
     return seed_files(root, {"files": files})
 
 
+def unifi_backup(root, specification):
+    """Carry an opaque Network application backup across the macOS VM boundary."""
+    if specification is None:
+        return None
+    if isinstance(specification, str):
+        path = contained(root, specification)
+        if path.suffix.lower() != ".unf":
+            raise ValueError("UniFi backup must be a Network application .unf file")
+        if not path.is_file() or not 0 < path.stat().st_size <= MAX_UNIFI_BACKUP:
+            raise ValueError("UniFi backup must be a nonempty regular file of at most 128 MiB")
+        data = path.read_bytes()
+    elif isinstance(specification, dict) and set(specification) == {"content"}:
+        value = specification["content"]
+        if not isinstance(value, str) or len(value) > 4 * ((MAX_UNIFI_BACKUP + 2) // 3):
+            raise ValueError("Invalid compiled UniFi backup")
+        try:
+            data = base64.b64decode(value, validate=True)
+        except (ValueError, TypeError):
+            raise ValueError("Invalid compiled UniFi backup encoding") from None
+    else:
+        raise ValueError("UniFi backup requires a relative .unf filename")
+    if not 0 < len(data) <= MAX_UNIFI_BACKUP:
+        raise ValueError("UniFi backup must be nonempty and at most 128 MiB")
+    return {"content": base64.b64encode(data).decode()}
+
+
 def expand(raw, root):
     raw = copy.deepcopy(raw)
     for app in raw.get("apps", []):
         if not isinstance(app, dict):
             continue
+        if app.get("kind") == "unifi" and isinstance(app.get("settings"), dict):
+            settings = app["settings"]
+            if "backup" in settings:
+                settings["backup"] = unifi_backup(root, settings["backup"])
         if app.get("seed") is not None:
             app["seed"] = {"files": seed_files(root, app["seed"])}
         if isinstance(app.get("setup"), str):

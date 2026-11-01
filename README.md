@@ -1,6 +1,6 @@
 # Home Stack
 
-Build an ARM64 openSUSE MicroOS appliance for a Raspberry Pi 5 with an NVMe HAT. JSON selects the initial containers; the default configuration deploys Home Assistant Container, Pi-hole, Immich and Seafile Community Edition. A Mosquitto preset and generic containers are also available. Application data and container storage live on SSD. OS and container updates run unattended, with health checks, application data rollback, and optional problem notifications.
+Build an ARM64 openSUSE MicroOS appliance for a Raspberry Pi 5 with an NVMe HAT. JSON selects the initial containers; the default configuration deploys Home Assistant Container, Pi-hole, Immich and OpenCloud. Optional UniFi Network and Mosquitto presets and generic containers are also available. Application data and container storage live on SSD. OS and container updates run unattended, with health checks, application data rollback, and optional problem notifications.
 
 **Status: experimental.** A complete image build and the automated tests pass. The supplied September 2026 openSUSE hardware documentation still lists SD-only boot; the stock MicroOS image must not be treated as NVMe-ready. Your working HAOS NVMe installation establishes the hardware/EEPROM path, but uses a different OS boot chain. See [Pi 5 boot support](docs/pi5-boot.md). This repository does not yet supply a hardware-qualified NVMe base image.
 
@@ -44,7 +44,7 @@ sudo python3 build.py --config config.json \
 
 Linux also accepts `--experimental-upstream`. A custom `--base-url` requires a trusted `--base-sha256`. The experimental download checks the checksum published over HTTPS; this is integrity checking, **not independent verification of the upstream GPG signature**. Verify signed downloads separately before trusting a pinned base.
 
-Output is `dist/home-stack-pi5.img`, a SHA-256 file, and a nonsecret manifest of base/container inputs. Output files are never overwritten, and the builder only partitions temporary regular files through loop devices. All enabled ARM64 container images, including Immich's and Seafile's dependencies, are bundled. First boot still needs internet access to install signed MicroOS packages through Combustion.
+Output is `dist/home-stack-pi5.img`, a SHA-256 file, and a nonsecret manifest of base/container inputs. Output files are never overwritten, and the builder only partitions temporary regular files through loop devices. All enabled ARM64 container images, including Immich's dependencies, are bundled. First boot still needs internet access to install signed MicroOS packages through Combustion.
 
 The default raw image is 32 GiB. Its root is expanded during assembly; the final seed partition caps usable space at the configured image size. A larger SSD's remaining space is unused. Set `image_size_mib` before building to allocate more space, leaving enough working space for downloads, image copies, and future application snapshots. A nominal 32 GB drive is smaller than this default image; use a larger SSD.
 
@@ -54,7 +54,9 @@ After first boot, open Pi-hole at `http://<pi-address>/admin/` and Home Assistan
 
 Open Immich at `http://<pi-address>:2283/` and complete its normal onboarding. It follows the latest stable `release` images automatically, using the existing daily update timer. Optional configuration-file seeding is available; the defaults leave settings editable in Immich. See [Immich configuration and storage](docs/immich.md), including hardware requirements and update limits.
 
-Open Seafile at `http://<pi-address>:8080/`. It initializes automatically and opens its normal login page. Supply initial admin credentials in JSON or retrieve the generated credentials from the appliance; see [Seafile first login and configuration](docs/seafile.md). Seafile, MariaDB and Redis follow moving maintenance tags through the daily update timer, with grouped health checks and rollback.
+Open OpenCloud at `https://<pi-address>:9200/` and accept its locally generated certificate for a direct LAN installation. Sign in as `admin`, using the configured initial password or the private credentials generated on the appliance. Its production image follows the daily update timer, preserving configuration and file data together for rollback. See [OpenCloud first login and configuration](docs/opencloud.md), including reverse proxy settings.
+
+Enable the optional `unifi` preset to manage UniFi devices at `https://<pi-address>:8443/`. Set `settings.backup` to a relative `.unf` file to restore a UniFi Network application backup during first initialization. Its default ports coexist with OpenCloud. See [UniFi configuration and restoration](docs/unifi.md) for the image contract and validation limits.
 
 After verifying DNS, configure your router to advertise the Pi as the clients' DNS server. A public secondary DNS server can bypass blocking even while Pi-hole is healthy; it is not guaranteed to be used only during failure.
 
@@ -64,14 +66,14 @@ After verifying DNS, configure your router to advertise the Pi as the clients' D
 
 | Setting | Behaviour |
 | --- | --- |
-| `apps` | Array of deployments; `name` must be unique and `kind` is `pihole`, `homeassistant`, `mosquitto`, `immich`, `seafile`, or `container` |
+| `apps` | Array of deployments; `name` must be unique and `kind` is `pihole`, `homeassistant`, `mosquitto`, `immich`, `opencloud`, `unifi`, or `container` |
 | `apps[].image` | Fully qualified image reference; use a moving tag for automatic releases or a digest to pin |
 | `apps[].enabled` | Defaults to true; disabled apps are not bundled or deployed |
 | `apps[].auto_update` | Defaults to true; false retains boot/recovery checks but disables automatic image pulls |
 | `apps[].environment` | Additional string environment values; managed preset values cannot be overridden |
 | `apps[].seed` | Initial data directory, optionally with explicitly named private overlays; never reapplied during ordinary updates |
 | `apps[].setup` | Home Assistant version-1 first-install manifest; resumable onboarding/integration/registry initialization |
-| `apps[].settings` | Preset settings: Pi-hole DNS/web options, Mosquitto users, Immich settings, or Seafile web port, public URL, initial admin and dependency images |
+| `apps[].settings` | Preset settings: Pi-hole DNS/web options, Mosquitto users, Immich settings, OpenCloud initialization/TLS, or UniFi backup, web port, inform host and guest portal |
 | `network` | Wired interface (`null` selects Ethernet automatically; explicit names such as `end0` also work), optional static IPv4 address/gateway, independent host DNS |
 | `updates` | Container/OS systemd calendars, jitter, health probation, failed-image cooldown |
 | `logging` | RAM-only or no host journal; default severity is `crit` |
@@ -93,7 +95,7 @@ A generic application needs an explicit host-accessible health check and one man
 }
 ```
 
-TCP health uses `{"kind":"tcp","port":8088}`. Generic containers can opt into host networking or privileges. Extra volumes/devices, multiple data mounts and arbitrary health shell commands are intentionally not exposed. For host networking, only the health port is opened by the generic preset; other protocol/firewall requirements need a dedicated preset. Keep all migration-sensitive data in the managed directory. Preset health/mount contracts are fixed; only one enabled instance of each preset is supported. Immich and Seafile dependency names are reserved to prevent clashes with other apps.
+TCP health uses `{"kind":"tcp","port":8088}`. Generic containers can opt into host networking or privileges. Extra volumes/devices, multiple data mounts and arbitrary health shell commands are intentionally not exposed. For host networking, only the health port is opened by the generic preset; other protocol/firewall requirements need a dedicated preset. Keep all migration-sensitive data in the managed directory. Preset health/mount contracts are fixed; only one enabled instance of each preset is supported. Immich dependency names are reserved to prevent clashes with other apps.
 
 Adlists seed new Pi-hole data only; subsequent UI changes survive updates. Pi-hole environment settings remain authoritative. Home Assistant keeps configuration, integration state and recorder history on SSD. Its initial YAML limits application logging to warnings; unlike Pi-hole's logs, its own files can persist in its data directory.
 
@@ -107,9 +109,11 @@ For each container, the controller pulls before stopping the service, stops clea
 
 Immich updates as a group: server, machine learning, PostgreSQL and Redis-compatible Valkey images are resolved before stopping anything. All four services stop before copying media, database, queue data and model cache. Health probation checks every service and the unauthenticated server ping, so a fresh installation can be accepted before an account exists. Recovery restores the complete image set and its data generation.
 
-Seafile also updates as a group. The controller waits for MariaDB initialization before starting Seafile, then checks the database, Redis, web API and file server. Files, configuration, database and credentials are copied together. Dependency-only changes trigger the same update and rollback process. See [Seafile update scope](docs/seafile.md#updates-and-recovery).
+OpenCloud uses one container with embedded identity services. The controller initializes it once, then copies its configuration, identity/storage data and private environment together on updates. Health probation checks the unauthenticated status and OpenID discovery endpoints, including the persisted issuer URL. See [OpenCloud updates and recovery](docs/opencloud.md#updates-and-recovery).
 
-These probes test service availability, not every integration or automation. A later rollback can lose changes made since the retained data snapshot. Local rollback copies are not backups against SSD failure; arrange independent backups for Home Assistant, Immich and Seafile, including their databases. An update briefly interrupts the updated service, and an OS reboot interrupts all services. A single Pi cannot provide uninterrupted DNS through reboots.
+UniFi's image contains its database; both configuration and MongoDB data live in the same managed generation. Initial backup restoration must finish before the generation is accepted. Later updates copy the restored data and completion record, preserving UI changes. See [UniFi restoration](docs/unifi.md).
+
+These probes test service availability, not every integration or automation. A later rollback can lose changes made since the retained data snapshot. Local rollback copies are not backups against SSD failure; arrange independent backups for Home Assistant, Immich and OpenCloud, including their configuration and databases. An update briefly interrupts the updated service, and an OS reboot interrupts all services. A single Pi cannot provide uninterrupted DNS through reboots.
 
 MicroOS transactional updates and health-checker provide OS recovery once Linux boots far enough to run health checks. They cannot guarantee recovery from EEPROM, U-Boot, FAT boot partition, power, or SSD failures. [MicroOS architecture](https://get.opensuse.org/microos/)
 

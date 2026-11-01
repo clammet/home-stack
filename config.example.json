@@ -49,10 +49,16 @@
       "settings": {"web_port": 2283, "config_file": null}
     },
     {
-      "name": "seafile",
-      "kind": "seafile",
+      "name": "opencloud",
+      "kind": "opencloud",
       "auto_update": true,
-      "settings": {"web_port": 8080, "server_url": null}
+      "settings": {"web_port": 9200, "server_url": null}
+    },
+    {
+      "name": "unifi",
+      "kind": "unifi",
+      "enabled": false,
+      "settings": {"web_port": 8443, "backup": null, "inform_host": null}
     }
   ]
 }

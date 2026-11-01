@@ -4,12 +4,14 @@ import argparse
 import base64
 import fcntl
 import hashlib
+import http.cookiejar
 import json
 import os
 from pathlib import Path
 import shutil
 import secrets
 import socket
+import ssl
 import struct
 import subprocess
 import time
@@ -18,9 +20,9 @@ from urllib.parse import urlsplit
 import uuid
 
 if __package__:
-    from .images import deployment_name, image_references
+    from .images import deployment_name, image_references, unifi_ports
 else:
-    from images import deployment_name, image_references
+    from images import deployment_name, image_references, unifi_ports
 
 ROOT = Path("/var/lib/home-stack")
 CONFIG = Path("/etc/home-stack/config.json")
@@ -192,6 +194,9 @@ class App:
         elif a["kind"] == "homeassistant":
             # Host D-Bus must not be relabelled; the upstream container requires host privileges.
             args.extend(("--volume", "/run/dbus:/run/dbus:ro"))
+        elif a["kind"] == "unifi":
+            ports = unifi_ports(a)
+            args.extend(("--init", "--image-volume=ignore", "--tmpfs", "/unifi/run:rw,nosuid,nodev,mode=1777"))
         for port in ports:
             args.extend(("--publish", port))
         # Detached conmon must survive the controller oneshot's service cgroup.
@@ -446,6 +451,108 @@ class App:
         self.save()
 
 
+class UnifiApp(App):
+    """The bundled controller owns MongoDB and restores only fresh generations."""
+    def seed(self, directory, image=None):
+        # The upstream entrypoint drops privileges after creating/chowning its
+        # subdirectories. The enclosing application directory remains private.
+        directory.chmod(0o755)
+        if self.app["settings"]["backup"] is not None:
+            atomic_json(directory / ".home-stack-restore.json", {"status": "pending"})
+
+    def opener(self):
+        # The controller generates its own certificate. This exception is used
+        # only for the fixed loopback endpoint, never for an input URL.
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), NoRedirect(),
+            urllib.request.HTTPSHandler(context=context),
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+    def request(self, opener, path, data=None, content_type="application/json"):
+        request = urllib.request.Request(
+            f"https://127.0.0.1:{self.app['settings']['web_port']}" + path,
+            data=data, headers={"Content-Type": content_type, "Accept": "application/json",
+                                "X-Requested-With": "XMLHttpRequest"})
+        with opener.open(request, timeout=30) as response:
+            result = json.load(response)
+            if response.status != 200 or not isinstance(result, dict) or result.get("meta", {}).get("rc") != "ok":
+                raise RuntimeError("UniFi initialization API rejected the request")
+            return result
+
+    def healthy(self):
+        try:
+            info = self.inspect()
+            return bool(info and info["State"]["Running"] and
+                        self.request(self.opener(), "/status")["meta"].get("up") is True)
+        except (OSError, ValueError, RuntimeError, AttributeError, subprocess.TimeoutExpired):
+            return False
+
+    def admin_count(self):
+        # A fresh controller must have no administrator; refuse to overwrite a
+        # configured database even if its restore marker has been damaged.
+        value = command("podman", "exec", self.name, "mongo", "--quiet", "--port", "27117",
+                        "ace", "--eval", "db.admin.count()", timeout=30)
+        if not value.isdecimal():
+            raise RuntimeError("Cannot verify UniFi database initialization state")
+        return int(value)
+
+    def start(self, generation):
+        super().start(generation)
+        marker = self.data(generation) / ".home-stack-restore.json"
+        if not marker.exists():
+            return
+        status = json.loads(marker.read_text()).get("status")
+        if status == "complete":
+            return
+        if status != "pending":
+            raise RuntimeError("UniFi restore was interrupted; refusing to replay it against this database")
+        try:
+            if not self.wait_healthy():
+                raise RuntimeError("UniFi did not become ready for initial backup restoration")
+            if self.admin_count() != 0:
+                raise RuntimeError("UniFi backup restoration requires a fresh, unconfigured database")
+            started = self.inspect()["State"]["StartedAt"]
+            backup = self.app["settings"]["backup"]
+            if backup is None:
+                raise RuntimeError("UniFi initial backup is missing")
+            data = base64.b64decode(backup["content"], validate=True)
+            boundary = "home-stack-" + uuid.uuid4().hex
+            body = (f'--{boundary}\r\nContent-Disposition: form-data; name="backupFile"; '
+                    'filename="restore.unf"\r\nContent-Type: application/octet-stream\r\n\r\n').encode()
+            body += data + f"\r\n--{boundary}--\r\n".encode()
+            opener = self.opener()
+            uploaded = self.request(opener, "/api/cmd/backup", body, "multipart/form-data; boundary=" + boundary)
+            details = uploaded.get("data")
+            if isinstance(details, list) and len(details) == 1:
+                details = details[0]
+            backup_id = details.get("backup_id") if isinstance(details, dict) else None
+            if not isinstance(backup_id, str) or not backup_id:
+                raise RuntimeError("UniFi did not accept the initial backup")
+            # Journal before issuing the non-idempotent restore command. The
+            # deployment journal discards an interrupted initial generation.
+            atomic_json(marker, {"status": "submitted"})
+            self.request(opener, "/api/cmd/system", json.dumps({"cmd": "restore", "backup": backup_id}).encode())
+            deadline = time.monotonic() + self.config["updates"]["health_timeout_seconds"]
+            while time.monotonic() < deadline:
+                info = self.inspect()
+                if (info and info["State"]["Running"] and info["State"]["StartedAt"] != started
+                        and self.healthy() and self.admin_count() > 0):
+                    atomic_json(marker, {"status": "complete"})
+                    return
+                time.sleep(5)
+            raise RuntimeError("UniFi backup restoration did not restart into a configured, healthy controller")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # HTTP/API bodies can contain private backup metadata. Do not
+            # propagate them into durable status or webhook notifications.
+            raise RuntimeError("UniFi backup restoration failed; check backup compatibility and controller version") from None
+
+
 class GroupApp(App):
     """Resolve, stop and recover dependency containers as one generation."""
     def component_name(self, component):
@@ -554,18 +661,14 @@ class ImmichApp(GroupApp):
             return False
 
 
-class SeafileApp(GroupApp):
-    """Seafile, MariaDB and Redis share one update and rollback boundary."""
-    components = ("server", "redis", "database")
-    mounts = {"server": ("shared", "/shared"), "redis": ("redis", "/data"),
-              "database": ("mysql", "/var/lib/mysql")}
+class OpenCloudApp(App):
+    """Keep OpenCloud's embedded identity, configuration and files together."""
+    mounts = {"config": "/etc/opencloud", "data": "/var/lib/opencloud"}
 
     def server_url(self):
         configured = self.app["settings"]["server_url"]
         if configured is not None:
             return configured.rstrip("/")
-        # Derive the LAN address only at first installation. Seafile persists
-        # absolute download URLs, so use a DHCP reservation for this address.
         address = self.config["network"]["address"]
         if address:
             host = address.split("/")[0]
@@ -574,104 +677,98 @@ class SeafileApp(GroupApp):
                 sock.connect((self.config["network"]["host_dns"][0], 53))
                 host = sock.getsockname()[0]
         port = self.app["settings"]["web_port"]
-        return "http://" + host + ("" if port == 80 else ":" + str(port))
+        return "https://" + host + ("" if port == 443 else ":" + str(port))
+
+    def mount_args(self, directory):
+        args = []
+        for folder, target in self.mounts.items():
+            args.extend(("--volume", f"{directory / folder}:{target}:Z"))
+        return args
 
     def seed(self, directory, image=None):
-        for folder, _ in self.mounts.values():
+        for folder in self.mounts:
             (directory / folder).mkdir(mode=0o700)
-        # Nginx workers traverse /shared to serve avatars/custom static files.
-        # The enclosing generation stays private on the host.
-        (directory / "shared").chmod(0o755)
-        super().seed(directory / "shared", image)
-        s = self.app["settings"]
-        # Keep first-login credentials accessible even after generation cleanup,
-        # and stable when an interrupted first installation is retried.
+        # The upstream image runs as UID/GID 1000. Only these two bind mounts
+        # need that owner; the generation and credential files stay root-only.
+        command("chown", "1000:1000", *(str(directory / folder) for folder in self.mounts))
         credentials = self.root / "initial-admin.json"
         if credentials.exists():
             admin = json.loads(credentials.read_text())
         else:
-            admin = {"email": s["admin_email"] or "admin@" + self.config["hostname"] + ".local",
-                     "password": s["admin_password"] or secrets.token_urlsafe(32)}
+            admin = {"username": "admin", "password": self.app["settings"]["admin_password"] or secrets.token_urlsafe(32)}
             atomic_json(credentials, admin)
-        parsed = urlsplit(self.server_url())
-        root_password, password, jwt = (secrets.token_urlsafe(32) for _ in range(3))
-        env = {
-            "SEAFILE_SERVER_HOSTNAME": parsed.netloc, "SEAFILE_SERVER_PROTOCOL": parsed.scheme,
-            "INIT_SEAFILE_ADMIN_EMAIL": admin["email"], "INIT_SEAFILE_ADMIN_PASSWORD": admin["password"],
-            "INIT_SEAFILE_MYSQL_ROOT_PASSWORD": root_password,
-            "SEAFILE_MYSQL_DB_PASSWORD": password, "JWT_PRIVATE_KEY": jwt,
-        }
-        for name, values in {
-            "server.env": env,
-            "database.env": {"MYSQL_ROOT_PASSWORD": root_password, "MYSQL_ROOT_HOST": "%",
-                             "MYSQL_LOG_CONSOLE": "true", "MARIADB_AUTO_UPGRADE": "1"},
-        }.items():
-            path = directory / name
-            path.write_text("".join(key + "=" + value + "\n" for key, value in values.items()))
-            path.chmod(0o600)
+        # Persist the canonical URL once: DHCP changes must not silently change
+        # the issuer or URLs in an accepted generation during health checks.
+        env = directory / "server.env"
+        env.write_text("OC_URL=" + self.server_url() + "\nIDM_ADMIN_PASSWORD=" + admin["password"] + "\n")
+        env.chmod(0o600)
+        self.remove()
+        try:
+            command("podman", "run", "--rm", "--name", self.name, "--pull=never",
+                    "--network=none", "--user", "1000:1000", "--image-volume=ignore", "--log-driver=none",
+                    *self.mount_args(directory),
+                    "--env-file", str(CONFIG.parent / (self.app["name"] + ".env")),
+                    "--env-file", str(env), image, "init", "--config-path", "/etc/opencloud",
+                    "--insecure", str(self.app["settings"]["insecure"]).lower(), timeout=180)
+        finally:
+            self.remove()
+        if not (directory / "config" / "opencloud.yaml").is_file():
+            raise RuntimeError("OpenCloud initialization did not create its configuration")
 
-    def database_ready(self):
-        return command("podman", "exec", self.component_name("database"), "healthcheck.sh",
-                       "--connect", "--mariadbupgrade", "--innodb_initialized", check=False, timeout=10) == 0
+    def matches(self, generation):
+        info = self.inspect()
+        return bool(info and info["State"]["Running"] and info["Image"] == generation["image"]
+                    and all(any(m.get("Source") == str(self.data(generation) / folder)
+                                and m.get("Destination") == target for m in info.get("Mounts", []))
+                            for folder, target in self.mounts.items()))
 
     def start(self, generation):
         directory = self.data(generation)
-        if not all((directory / folder).is_dir() for folder, _ in self.mounts.values()) or not all(
-            (directory / name).is_file() for name in ("server.env", "database.env")
+        if not all((directory / folder).is_dir() for folder in self.mounts) or not all(
+            (directory / name).is_file() for name in ("server.env", "config/opencloud.yaml")
         ):
             raise RuntimeError("Generation data missing; refusing an empty replacement")
         self.stop()
         self.remove()
-        network = self.name + "-network"
-        command("podman", "network", "create", "--ignore", network)
-        for component in reversed(self.components):
-            folder, target = self.mounts[component]
-            args = ["--network", network, "--network-alias", component,
-                    "--volume", f"{directory / folder}:{target}:Z"]
-            tail = []
-            if component == "database":
-                args.extend(("--env-file", str(directory / "database.env")))
-            elif component == "redis":
-                # Cache is disposable; keep the server off the host network.
-                tail = ["redis-server", "--save", "", "--appendonly", "no"]
-            else:
-                args.extend(("--publish", f"{self.app['settings']['web_port']}:80/tcp",
-                             "--env-file", str(CONFIG.parent / (self.app["name"] + ".env")),
-                             "--env-file", str(directory / "server.env")))
-            name = self.component_name(component)
-            command("systemd-run", "--scope", "--quiet", "--collect", "--slice=machine.slice",
-                    "--unit=" + name + "-" + uuid.uuid4().hex,
-                    "podman", "run", "--detach", "--name", name, "--pull=never",
-                    "--restart=always", "--log-driver=none", "--health-cmd=none",
-                    *args, generation["image"][component], *tail, timeout=180)
-            if component == "database":
-                deadline = time.monotonic() + self.config["updates"]["health_timeout_seconds"]
-                while not self.database_ready():
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("Seafile database failed startup health checks")
-                    time.sleep(5)
+        command("systemd-run", "--scope", "--quiet", "--collect", "--slice=machine.slice",
+                "--unit=" + self.name + "-" + uuid.uuid4().hex,
+                "podman", "run", "--detach", "--name", self.name, "--pull=never",
+                "--restart=always", "--log-driver=none", "--health-cmd=none", "--image-volume=ignore",
+                "--network", "bridge", "--user", "1000:1000", *self.mount_args(directory),
+                "--publish", f"{self.app['settings']['web_port']}:9200/tcp",
+                "--env-file", str(CONFIG.parent / (self.app["name"] + ".env")),
+                "--env-file", str(directory / "server.env"), generation["image"], "server", timeout=180)
 
     def healthy(self):
         try:
-            for component in self.components:
-                info = self.inspect(self.component_name(component))
-                if not info or not info["State"]["Running"]:
-                    return False
-            if not self.database_ready():
+            info = self.inspect()
+            if not info or not info["State"]["Running"]:
                 return False
-            if command("podman", "exec", self.component_name("redis"), "redis-cli", "ping", timeout=10) != "PONG":
-                return False
-            # Check the published port locally even when public HTTPS terminates
-            # upstream. The Host header matches Seafile's configured authority.
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            authority = urlsplit(self.server_url()).netloc
+            # Probe the running generation's issuer, including while rollback
+            # still has a failed candidate recorded in the pending journal.
+            env = info.get("Config", {}).get("Env", [])
+            issuer = next(line[len("OC_URL="):] for line in env if line.startswith("OC_URL="))
+            # Self-signed TLS is accepted only on this fixed loopback probe.
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *args, **kwargs):
+                    return None
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
+                                                 urllib.request.HTTPSHandler(context=context))
+            scheme = "https" if self.app["settings"]["proxy_tls"] else "http"
             def probe(path):
-                request = urllib.request.Request(f"http://127.0.0.1:{self.app['settings']['web_port']}" + path,
-                                                 headers={"Host": authority, "Accept": "application/json"})
+                request = urllib.request.Request(f"{scheme}://127.0.0.1:{self.app['settings']['web_port']}" + path,
+                                                 headers={"Host": urlsplit(issuer).netloc, "Accept": "application/json"})
                 with opener.open(request, timeout=5) as response:
                     return json.load(response) if response.status == 200 else None
-            return probe("/api2/ping/") == "pong" and probe("/seafhttp/protocol-version").get("version") == 2
-        except (OSError, ValueError, RuntimeError, AttributeError, subprocess.TimeoutExpired):
+            status = probe("/status.php")
+            oidc = probe("/.well-known/openid-configuration")
+            return (status.get("installed") is True and status.get("maintenance") is False
+                    and oidc.get("issuer") == issuer and bool(oidc.get("authorization_endpoint"))
+                    and bool(oidc.get("token_endpoint")))
+        except (OSError, ValueError, RuntimeError, AttributeError, StopIteration, subprocess.TimeoutExpired):
             return False
 
 
@@ -716,7 +813,7 @@ class Status:
 
 
 def operate(config, action, root=ROOT):
-    apps = [{"immich": ImmichApp, "seafile": SeafileApp}.get(a["kind"], App)(config, a, root)
+    apps = [{"immich": ImmichApp, "opencloud": OpenCloudApp, "unifi": UnifiApp}.get(a["kind"], App)(config, a, root)
             for a in config["apps"] if a["enabled"]]
     status = Status(config, root)
     if action == "check":

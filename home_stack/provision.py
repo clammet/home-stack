@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import shlex
 import shutil
-from runtime.images import deployment_name, image_references
+from runtime.images import deployment_name, image_references, unifi_ports
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime" / "controller.py"
 
@@ -41,15 +41,17 @@ def environment(config, app):
                    DB_DATABASE_NAME="immich", REDIS_HOSTNAME="redis", REDIS_PORT="6379")
         if app["settings"]["config_file"] is not None:
             env["IMMICH_CONFIG_FILE"] = "/config/" + app["settings"]["config_file"]
-    if app["kind"] == "seafile":
-        env.update(TIME_ZONE=config["timezone"], SEAFILE_MYSQL_DB_HOST="database",
-                   SEAFILE_MYSQL_DB_PORT="3306", SEAFILE_MYSQL_DB_USER="seafile",
-                   SEAFILE_MYSQL_DB_CCNET_DB_NAME="ccnet_db", SEAFILE_MYSQL_DB_SEAFILE_DB_NAME="seafile_db",
-                   SEAFILE_MYSQL_DB_SEAHUB_DB_NAME="seahub_db", CACHE_PROVIDER="redis",
-                   REDIS_HOST="redis", REDIS_PORT="6379", REDIS_PASSWORD="",
-                   SITE_ROOT="/", NON_ROOT="false", ENABLE_GO_FILESERVER="true",
-                   ENABLE_SEADOC="false", ENABLE_NOTIFICATION_SERVER="false",
-                   ENABLE_SEAFILE_AI="false", ENABLE_FACE_RECOGNITION="false")
+    if app["kind"] == "opencloud":
+        env.update(OC_CONFIG_DIR="/etc/opencloud", OC_BASE_DATA_PATH="/var/lib/opencloud",
+                   PROXY_HTTP_ADDR="0.0.0.0:9200", IDM_CREATE_DEMO_USERS="false",
+                   PROXY_TLS=str(app["settings"]["proxy_tls"]).lower(),
+                   OC_INSECURE=str(app["settings"]["insecure"]).lower())
+        env.setdefault("OC_LOG_LEVEL", "error")
+    if app["kind"] == "unifi":
+        env.update(RUNAS_UID0="false", BIND_PRIV="false", UNIFI_HTTP_PORT="8080",
+                   UNIFI_HTTPS_PORT="8443", PORTAL_HTTP_PORT="8880", PORTAL_HTTPS_PORT="8843")
+        if app["settings"]["inform_host"] is not None:
+            env["SYSTEM_IP"] = app["settings"]["inform_host"]
     return env
 
 
@@ -148,7 +150,7 @@ printf '%s' '{encoded}' | base64 -d > /etc/NetworkManager/system-connections/hom
 chmod 600 /etc/NetworkManager/system-connections/home-stack.nmconnection
 if [ "${{1-}}" = --prepare ]; then exit 0; fi
 
-zypper --non-interactive install --no-recommends podman python3 health-checker curl bluez{' netavark aardvark-dns' if any(a['kind'] in ('immich', 'seafile') for a in apps) else ''}
+zypper --non-interactive install --no-recommends podman python3 health-checker curl bluez{' netavark aardvark-dns' if any(a['kind'] in ('immich', 'opencloud') for a in apps) else ''}
 # Persistent subvolumes must be mounted inside the first-boot transaction.
 mountpoint -q /var || mount /var
 mountpoint -q /usr/local || mount /usr/local
@@ -202,8 +204,10 @@ printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\nPermitRoot
             ports = ["8123:8123/tcp", "5353:5353/udp", "1900:1900/udp"]
         elif app["kind"] == "immich":
             ports = [f"{app['settings']['web_port']}:2283/tcp"]
-        elif app["kind"] == "seafile":
-            ports = [f"{app['settings']['web_port']}:80/tcp"]
+        elif app["kind"] == "opencloud":
+            ports = [f"{app['settings']['web_port']}:9200/tcp"]
+        elif app["kind"] == "unifi":
+            ports = unifi_ports(app)
         elif app["network"] == "host":
             port = app["health"].get("port")
             if app["health"]["kind"] == "http":
